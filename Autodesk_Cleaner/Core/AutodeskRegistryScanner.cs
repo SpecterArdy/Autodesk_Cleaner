@@ -86,10 +86,21 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
     /// <inheritdoc />
     public async Task<RemovalResult> RemoveEntriesAsync(IReadOnlyCollection<RegistryEntry> entries)
     {
-        if (!ValidateEntries(entries))
+        // Filter to only valid entries
+        var validEntries = FilterValidEntries(entries);
+        
+        if (validEntries.Count == 0)
         {
-            throw new ArgumentException("Invalid entries provided for removal", nameof(entries));
+            Logger.Error("Registry entry validation failed - no valid entries found to process");
+            return new RemovalResult(
+                TotalEntries: 0,
+                SuccessfulRemovals: 0,
+                FailedRemovals: 0,
+                Errors: ["Entry validation failed - no Autodesk-related entries found to process"],
+                Duration: TimeSpan.Zero);
         }
+        
+        Logger.Info("Processing {ValidCount} valid entries out of {TotalCount} total entries", validEntries.Count, entries.Count);
 
         var stopwatch = Stopwatch.StartNew();
         var errors = new List<string>();
@@ -120,8 +131,20 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             }
         }
 
-        // Process each entry
-        foreach (var entry in entries)
+        // Process each valid entry
+        if (!validEntries.Any())
+        {
+            Logger.Warn("No valid registry entries to process.");
+            return new RemovalResult(
+                TotalEntries: 0,
+                SuccessfulRemovals: 0,
+                FailedRemovals: 0,
+                Errors: ["No valid entries found"],
+                Duration: TimeSpan.Zero
+            );
+        }
+
+        foreach (var entry in validEntries)
         {
             try
             {
@@ -154,9 +177,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
         stopwatch.Stop();
 
         return new RemovalResult(
-            TotalEntries: entries.Count,
+            TotalEntries: validEntries.Count,
             SuccessfulRemovals: successfulRemovals,
-            FailedRemovals: entries.Count - successfulRemovals,
+            FailedRemovals: validEntries.Count - successfulRemovals,
             Errors: errors,
             Duration: stopwatch.Elapsed);
     }
@@ -204,14 +227,137 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
     {
         if (entries is null || entries.Count == 0)
         {
+            Logger.Warn("ValidateEntries failed: entries is null or empty");
             return false;
         }
 
-        // Validate that all entries are Autodesk-related
-        return entries.All(entry => 
-            AutodeskPattern.IsMatch(entry.KeyPath) || 
-            (entry.ValueName is not null && AutodeskPattern.IsMatch(entry.ValueName)) ||
-            (entry.ValueData is string valueData && AutodeskPattern.IsMatch(valueData)));
+        Logger.Info("Validating {EntryCount} registry entries", entries.Count);
+        AnsiConsole.WriteLine($"[DEBUG] Starting validation of {entries.Count} registry entries");
+        
+        // Check each entry and track valid/invalid for debugging
+        var validEntries = new List<RegistryEntry>();
+        var invalidEntries = new List<RegistryEntry>();
+        
+        foreach (var entry in entries)
+        {
+            var isAutodeskPath = IsAutodeskRegistryPath(entry.KeyPath);
+            var matchesKeyPath = AutodeskPattern.IsMatch(entry.KeyPath);
+            var matchesValueName = entry.ValueName is not null && AutodeskPattern.IsMatch(entry.ValueName);
+            var matchesValueData = entry.ValueData is string valueData && AutodeskPattern.IsMatch(valueData);
+            
+            var isValid = isAutodeskPath || matchesKeyPath || matchesValueName || matchesValueData;
+            
+            if (isValid)
+            {
+                validEntries.Add(entry);
+            }
+            else
+            {
+                invalidEntries.Add(entry);
+                Logger.Info("Invalid entry: {KeyPath}, AutodeskPath: {IsAutodeskPath}, KeyMatch: {MatchesKeyPath}, ValueNameMatch: {MatchesValueName}, ValueDataMatch: {MatchesValueData}", 
+                    entry.KeyPath, isAutodeskPath, matchesKeyPath, matchesValueName, matchesValueData);
+            }
+        }
+        
+        Logger.Info("Validation results: {ValidCount} valid entries, {InvalidCount} invalid entries out of {TotalCount} total", 
+            validEntries.Count, invalidEntries.Count, entries.Count);
+        AnsiConsole.WriteLine($"[DEBUG] Found {validEntries.Count} valid entries and {invalidEntries.Count} invalid entries");
+        
+        if (invalidEntries.Count > 0)
+        {
+            Logger.Warn("Found {InvalidCount} invalid entries out of {TotalCount} - these will be filtered out", invalidEntries.Count, entries.Count);
+            // Log first few invalid entries for debugging
+            foreach (var entry in invalidEntries.Take(5))
+            {
+                Logger.Debug("Invalid entry example: {KeyPath} (ValueName: {ValueName})", entry.KeyPath, entry.ValueName ?? "<null>");
+                AnsiConsole.WriteLine($"[DEBUG] Invalid entry: {entry.KeyPath}");
+            }
+        }
+        
+        // Return true if we have ANY valid entries to process
+        var hasValidEntries = validEntries.Count > 0;
+        Logger.Info("Validation result: {HasValidEntries} - {ValidCount} entries will be processed", 
+            hasValidEntries ? "PASS" : "FAIL", validEntries.Count);
+        AnsiConsole.WriteLine($"[DEBUG] Validation result: {(hasValidEntries ? "PASS" : "FAIL")}");
+        
+        return hasValidEntries;
+    }
+
+    /// <summary>
+    /// Gets the count of valid Autodesk-related entries from a collection.
+    /// </summary>
+    /// <param name="entries">The registry entries to analyze.</param>
+    /// <returns>The number of valid entries.</returns>
+    public int GetValidEntryCount(IReadOnlyCollection<RegistryEntry> entries)
+    {
+        Logger.Info("GetValidEntryCount: Starting count for {EntryCount} registry entries", entries?.Count ?? 0);
+        if (entries == null || entries.Count == 0)
+        {
+            Logger.Warn("GetValidEntryCount: Null or empty entries provided");
+            return 0;
+        }
+        var validEntries = FilterValidEntries(entries);
+        Logger.Info("GetValidEntryCount: Found {ValidCount} valid registry entries", validEntries.Count);
+        return validEntries.Count;
+    }
+
+    /// <summary>
+    /// Filters registry entries to only include valid Autodesk-related entries.
+    /// </summary>
+    /// <param name="entries">The registry entries to filter.</param>
+    /// <returns>A list of valid Autodesk-related entries.</returns>
+    private List<RegistryEntry> FilterValidEntries(IReadOnlyCollection<RegistryEntry> entries)
+    {
+        if (entries is null || entries.Count == 0)
+        {
+            Logger.Info("FilterValidEntries: entries is null or empty");
+            return new List<RegistryEntry>();
+        }
+
+        Logger.Info("FilterValidEntries: Processing {EntryCount} entries", entries.Count);
+        var validEntries = new List<RegistryEntry>();
+        var invalidCount = 0;
+        
+        foreach (var entry in entries)
+        {
+            var isAutodeskPath = IsAutodeskRegistryPath(entry.KeyPath);
+            var matchesKeyPath = AutodeskPattern.IsMatch(entry.KeyPath);
+            var matchesValueName = entry.ValueName is not null && AutodeskPattern.IsMatch(entry.ValueName);
+            var matchesValueData = entry.ValueData is string valueData && AutodeskPattern.IsMatch(valueData);
+            
+            var isValid = isAutodeskPath || matchesKeyPath || matchesValueName || matchesValueData;
+            
+            if (isValid)
+            {
+                validEntries.Add(entry);
+            }
+            else
+            {
+                invalidCount++;
+                if (invalidCount <= 3) // Log first 3 invalid entries for debugging
+                {
+                    Logger.Debug("FilterValidEntries: Invalid entry {KeyPath} - AutodeskPath: {IsAutodeskPath}, KeyMatch: {MatchesKeyPath}, ValueNameMatch: {MatchesValueName}, ValueDataMatch: {MatchesValueData}", 
+                        entry.KeyPath, isAutodeskPath, matchesKeyPath, matchesValueName, matchesValueData);
+                }
+            }
+        }
+        
+        Logger.Info("FilterValidEntries: Found {ValidCount} valid entries, {InvalidCount} invalid entries", validEntries.Count, invalidCount);
+        return validEntries;
+    }
+
+    /// <summary>
+    /// Checks if a registry path is under a known Autodesk registry location.
+    /// </summary>
+    /// <param name="keyPath">The registry key path to check.</param>
+    /// <returns>True if the path is under an Autodesk registry location.</returns>
+    private static bool IsAutodeskRegistryPath(string keyPath)
+    {
+        if (string.IsNullOrEmpty(keyPath))
+            return false;
+
+        return AutodeskRegistryPaths.Any(basePath => 
+            keyPath.StartsWith(basePath, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>

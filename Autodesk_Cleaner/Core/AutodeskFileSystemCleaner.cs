@@ -126,10 +126,21 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     /// <inheritdoc />
     public async Task<RemovalResult> RemoveEntriesAsync(IReadOnlyCollection<FileSystemEntry> entries)
     {
-        if (!ValidateEntries(entries))
+        // Filter to only valid entries
+        var validEntries = FilterValidEntries(entries);
+        
+        if (validEntries.Count == 0)
         {
-            throw new ArgumentException("Invalid entries provided for removal", nameof(entries));
+            Logger.Error("File system entry validation failed - no valid entries found to process");
+            return new RemovalResult(
+                TotalEntries: 0,
+                SuccessfulRemovals: 0,
+                FailedRemovals: 0,
+                Errors: ["Entry validation failed - no Autodesk-related entries found to process"],
+                Duration: TimeSpan.Zero);
         }
+        
+        Logger.Info("Processing {ValidCount} valid entries out of {TotalCount} total entries", validEntries.Count, entries.Count);
 
         var stopwatch = Stopwatch.StartNew();
         var errors = new List<string>();
@@ -154,8 +165,20 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             }
         }
 
-        // Process each entry
-        foreach (var entry in entries)
+        // Process each valid entry
+        if (!validEntries.Any())
+        {
+            Logger.Warn("No valid file system entries to process.");
+            return new RemovalResult(
+                TotalEntries: 0,
+                SuccessfulRemovals: 0,
+                FailedRemovals: 0,
+                Errors: ["No valid entries found"],
+                Duration: TimeSpan.Zero
+            );
+        }
+
+        foreach (var entry in validEntries)
         {
             try
             {
@@ -184,9 +207,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         stopwatch.Stop();
 
         return new RemovalResult(
-            TotalEntries: entries.Count,
+            TotalEntries: validEntries.Count,
             SuccessfulRemovals: successfulRemovals,
-            FailedRemovals: entries.Count - successfulRemovals,
+            FailedRemovals: validEntries.Count - successfulRemovals,
             Errors: errors,
             Duration: stopwatch.Elapsed);
     }
@@ -239,13 +262,145 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     {
         if (entries is null || entries.Count == 0)
         {
+            Logger.Warn("ValidateEntries failed: entries is null or empty");
             return false;
         }
 
-        // Validate that all entries are Autodesk-related
-        return entries.All(entry => 
-            AutodeskPattern.IsMatch(entry.Path) || 
-            FlexNetPattern.IsMatch(Path.GetFileName(entry.Path)));
+        Logger.Info("Validating {EntryCount} file system entries", entries.Count);
+        
+        // Check each entry and count valid/invalid for debugging
+        var validEntries = new List<FileSystemEntry>();
+        var invalidEntries = new List<FileSystemEntry>();
+        
+        foreach (var entry in entries)
+        {
+            var isAutodeskPath = IsAutodeskPath(entry.Path);
+            var matchesPath = AutodeskPattern.IsMatch(entry.Path);
+            var matchesFileName = AutodeskPattern.IsMatch(Path.GetFileName(entry.Path));
+            var matchesFlexNet = FlexNetPattern.IsMatch(Path.GetFileName(entry.Path));
+            
+            var isValid = isAutodeskPath || matchesPath || matchesFileName || matchesFlexNet;
+            
+            if (isValid)
+            {
+                validEntries.Add(entry);
+            }
+            else
+            {
+                invalidEntries.Add(entry);
+                Logger.Debug("Invalid entry: {Path}, AutodeskPath: {IsAutodeskPath}, PathMatch: {MatchesPath}, FileNameMatch: {MatchesFileName}, FlexNetMatch: {MatchesFlexNet}", 
+                    entry.Path, isAutodeskPath, matchesPath, matchesFileName, matchesFlexNet);
+            }
+        }
+        
+        Logger.Info("Validation results: {ValidCount} valid entries, {InvalidCount} invalid entries out of {TotalCount} total", 
+            validEntries.Count, invalidEntries.Count, entries.Count);
+        
+        if (invalidEntries.Count > 0)
+        {
+            Logger.Warn("Found {InvalidCount} invalid entries out of {TotalCount} - these will be filtered out", invalidEntries.Count, entries.Count);
+            // Log first few invalid entries for debugging
+            foreach (var entry in invalidEntries.Take(3))
+            {
+                Logger.Debug("Invalid entry example: {Path}", entry.Path);
+            }
+        }
+        
+        // Return true if we have ANY valid entries to process
+        var hasValidEntries = validEntries.Count > 0;
+        Logger.Info("Validation result: {HasValidEntries} - {ValidCount} entries will be processed", 
+            hasValidEntries ? "PASS" : "FAIL", validEntries.Count);
+        
+        return hasValidEntries;
+    }
+
+    /// <summary>
+    /// Gets the count of valid Autodesk-related entries from a collection.
+    /// </summary>
+    /// <param name="entries">The file system entries to analyze.</param>
+    /// <returns>The number of valid entries.</returns>
+    public int GetValidEntryCount(IReadOnlyCollection<FileSystemEntry> entries)
+    {
+        Logger.Info("GetValidEntryCount: Starting count for {EntryCount} file system entries", entries?.Count ?? 0);
+        if (entries == null || entries.Count == 0)
+        {
+            Logger.Warn("GetValidEntryCount: Null or empty entries provided");
+            return 0;
+        }
+        var validEntries = FilterValidEntries(entries);
+        Logger.Info("GetValidEntryCount: Found {ValidCount} valid file system entries", validEntries.Count);
+        return validEntries.Count;
+    }
+
+    /// <summary>
+    /// Filters file system entries to only include valid Autodesk-related entries.
+    /// </summary>
+    /// <param name="entries">The file system entries to filter.</param>
+    /// <returns>A list of valid Autodesk-related entries.</returns>
+    private List<FileSystemEntry> FilterValidEntries(IReadOnlyCollection<FileSystemEntry> entries)
+    {
+        if (entries is null || entries.Count == 0)
+        {
+            Logger.Info("FilterValidEntries: entries is null or empty");
+            return new List<FileSystemEntry>();
+        }
+
+        Logger.Info("FilterValidEntries: Processing {EntryCount} file system entries", entries.Count);
+        var validEntries = new List<FileSystemEntry>();
+        var invalidCount = 0;
+        
+        foreach (var entry in entries)
+        {
+            var isAutodeskPath = IsAutodeskPath(entry.Path);
+            var matchesPath = AutodeskPattern.IsMatch(entry.Path);
+            var matchesFileName = AutodeskPattern.IsMatch(Path.GetFileName(entry.Path));
+            var matchesFlexNet = FlexNetPattern.IsMatch(Path.GetFileName(entry.Path));
+            
+            var isValid = isAutodeskPath || matchesPath || matchesFileName || matchesFlexNet;
+            
+            if (isValid)
+            {
+                validEntries.Add(entry);
+            }
+            else
+            {
+                invalidCount++;
+                if (invalidCount <= 3) // Log first 3 invalid entries for debugging
+                {
+                    Logger.Debug("FilterValidEntries: Invalid file entry {Path} - AutodeskPath: {IsAutodeskPath}, PathMatch: {MatchesPath}, FileNameMatch: {MatchesFileName}, FlexNetMatch: {MatchesFlexNet}", 
+                        entry.Path, isAutodeskPath, matchesPath, matchesFileName, matchesFlexNet);
+                }
+            }
+        }
+        
+        Logger.Info("FilterValidEntries: Found {ValidCount} valid file system entries, {InvalidCount} invalid entries", validEntries.Count, invalidCount);
+        return validEntries;
+    }
+
+    /// <summary>
+    /// Checks if a file system path is under a known Autodesk directory.
+    /// </summary>
+    /// <param name="path">The file system path to check.</param>
+    /// <returns>True if the path is under an Autodesk directory.</returns>
+    private static bool IsAutodeskPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        // Check if path is under any of the known Autodesk paths
+        if (AutodeskPaths.Any(basePath => 
+            path.StartsWith(basePath, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        // Check if path is under any user-specific Autodesk paths
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return UserAutodeskPaths.Any(relativePath => 
+        {
+            var fullPath = Path.Combine(userProfile, relativePath);
+            return path.StartsWith(fullPath, StringComparison.OrdinalIgnoreCase);
+        });
     }
 
     /// <summary>

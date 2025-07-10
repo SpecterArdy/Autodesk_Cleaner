@@ -3,6 +3,7 @@ using NLog.Config;
 using NLog.Targets;
 using Tomlyn;
 using Tomlyn.Model;
+using Spectre.Console;
 
 namespace Autodesk_Cleaner.Core;
 
@@ -19,24 +20,59 @@ public static class LoggingConfiguration
     {
         try
         {
+            // Register our custom TOML target with modern NLog API
+            LogManager.Setup().SetupExtensions(s => s.RegisterTarget<TomlFileTarget>("TomlFile"));
+            
+            AnsiConsole.WriteLine($"[DEBUG] Looking for nlog config at: {Path.GetFullPath(configPath)}");
             if (!File.Exists(configPath))
             {
+                AnsiConsole.WriteLine($"[DEBUG] TOML config file not found, using default configuration");
                 // Create default configuration if file doesn't exist
                 CreateDefaultConfiguration();
                 return;
             }
+            
+            AnsiConsole.WriteLine($"[DEBUG] Loading TOML configuration from: {configPath}");
 
             var tomlContent = File.ReadAllText(configPath);
             var model = Toml.ToModel(tomlContent);
             
             var config = CreateNLogConfigurationFromToml(model);
+            
+            // Create log directories (TOML config doesn't do this automatically)
+            AnsiConsole.WriteLine($"[DEBUG] Creating log directories for TOML config...");
+            CreateLogDirectories();
+            
             LogManager.Configuration = config;
             
-            var logger = LogManager.GetCurrentClassLogger();
-            logger.Info("NLog configuration loaded successfully from TOML file: {ConfigPath}", configPath);
+            // Debug: Check if targets were created
+            AnsiConsole.WriteLine($"[DEBUG] Configured targets: {string.Join(", ", config.AllTargets.Select(t => t.Name))}");
+            AnsiConsole.WriteLine($"[DEBUG] Configured rules: {config.LoggingRules.Count}");
+        
+        var logger = LogManager.GetCurrentClassLogger();
+        logger.Info("NLog configuration loaded successfully from TOML file: {ConfigPath}", configPath);
+        
+        // Test file logging immediately
+        AnsiConsole.WriteLine($"[DEBUG] Testing file logging...");
+        logger.Info("TOML FILE LOGGING TEST - This should appear in log files");
+        logger.Error("TOML ERROR LOGGING TEST - This should appear in log files");
+        
+        // Force flush to ensure files are written
+        AnsiConsole.WriteLine($"[DEBUG] Flushing log files...");
+        LogManager.Flush();
+        
+        // Debug: Check if files were created
+        var logDir = Path.GetFullPath("logs");
+        var logFiles = Directory.GetFiles(logDir, "*.log", SearchOption.AllDirectories);
+        AnsiConsole.WriteLine($"[DEBUG] Log files found: {logFiles.Length}");
+        foreach (var file in logFiles)
+        {
+            AnsiConsole.WriteLine($"[DEBUG] - {file} ({new FileInfo(file).Length} bytes)");
+        }
         }
         catch (Exception ex)
         {
+            AnsiConsole.WriteLine($"[DEBUG] Error loading TOML config: {ex.Message}");
             // Fallback to default configuration if TOML parsing fails
             CreateDefaultConfiguration();
             var logger = LogManager.GetCurrentClassLogger();
@@ -120,13 +156,17 @@ public static class LoggingConfiguration
         if (!targetTable.TryGetValue("name", out var nameValue) || nameValue is not string name ||
             !targetTable.TryGetValue("type", out var typeValue) || typeValue is not string type)
         {
+            AnsiConsole.WriteLine($"[DEBUG] Invalid target table - missing name or type");
             return null;
         }
+
+        AnsiConsole.WriteLine($"[DEBUG] Creating target: {name} of type {type}");
 
         Target target = type.ToLowerInvariant() switch
         {
             "file" => new FileTarget(),
             "coloredconsole" => new ColoredConsoleTarget(),
+            "tomlfile" => new TomlFileTarget(),
             _ => throw new NotSupportedException($"Target type '{type}' is not supported")
         };
 
@@ -138,6 +178,8 @@ public static class LoggingConfiguration
             if (property.Key is "name" or "type")
                 continue;
 
+            AnsiConsole.WriteLine($"[DEBUG] Setting property {property.Key} = {property.Value}");
+            
             if (property.Value is string stringValue)
             {
                 SetTargetProperty(target, property.Key, stringValue);
@@ -152,6 +194,7 @@ public static class LoggingConfiguration
             }
         }
 
+        AnsiConsole.WriteLine($"[DEBUG] Target {name} created successfully");
         return target;
     }
 
@@ -214,36 +257,127 @@ public static class LoggingConfiguration
         {
             try
             {
-                var convertedValue = Convert.ChangeType(propertyValue, property.PropertyType);
+                object convertedValue;
+                
+                // Handle special NLog property types
+                if (property.PropertyType == typeof(NLog.Layouts.Layout) || property.PropertyType.IsSubclassOf(typeof(NLog.Layouts.Layout)))
+                {
+                    convertedValue = NLog.Layouts.Layout.FromString(propertyValue);
+                }
+                else if (property.PropertyType == typeof(System.Text.Encoding))
+                {
+                    convertedValue = System.Text.Encoding.GetEncoding(propertyValue);
+                }
+                else if (property.PropertyType == typeof(FileArchivePeriod))
+                {
+                    convertedValue = Enum.Parse(typeof(FileArchivePeriod), propertyValue, true);
+                }
+                else
+                {
+                    convertedValue = Convert.ChangeType(propertyValue, property.PropertyType);
+                }
+                
                 property.SetValue(target, convertedValue);
+                AnsiConsole.WriteLine($"[DEBUG] Successfully set {propertyName} = {propertyValue} on {target.Name}");
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore conversion errors for properties that can't be set
+                AnsiConsole.WriteLine($"[DEBUG] Failed to set {propertyName} = {propertyValue} on {target.Name}: {ex.Message}");
             }
+        }
+        else
+        {
+            AnsiConsole.WriteLine($"[DEBUG] Property {propertyName} not found or not writable on {target.GetType().Name}");
         }
     }
 
+    /// <summary>
+    /// Creates a TOML-formatted layout for modern structured logging.
+    /// </summary>
+    /// <returns>TOML layout string.</returns>
+    private static string CreateTomlLayout()
+    {
+        return @"# Autodesk Cleaner Log Entry
+[entry]
+timestamp = ""${longdate}""
+level = ""${level:uppercase=true}""
+logger = ""${logger}""
+message = ""${message}""
+thread = ""${threadid}""
+user = ""${environment-user}""
+machine = ""${machinename}""
+version = ""1.0.0""
+${when:when='${exception}'!='':inner=[exception]
+type = ""${exception:format=@}""
+message = ""${exception:format=message}""
+stack_trace = ""${exception:format=tostring}""}
+";
+    }
+    
+    /// <summary>
+    /// Creates the log directory needed for file logging.
+    /// </summary>
+    private static void CreateLogDirectories()
+    {
+        try
+        {
+            Directory.CreateDirectory("logs");
+            Directory.CreateDirectory("logs/archive");
+            AnsiConsole.WriteLine($"[DEBUG] Log directories created successfully");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.WriteLine($"[DEBUG] Error creating log directories: {ex.Message}");
+        }
+    }
+    
     /// <summary>
     /// Creates a default NLog configuration when TOML file is not available.
     /// </summary>
     private static void CreateDefaultConfiguration()
     {
+        AnsiConsole.WriteLine($"[DEBUG] Creating default NLog configuration");
+        
+        // Register our custom TOML target with modern NLog API
+        LogManager.Setup().SetupExtensions(s => s.RegisterTarget<TomlFileTarget>("TomlFile"));
+        
         var config = new NLog.Config.LoggingConfiguration();
 
         // Create directories
-        Directory.CreateDirectory("logs");
-        Directory.CreateDirectory("logs/operations");
-        Directory.CreateDirectory("logs/errors");
-        Directory.CreateDirectory("logs/registry");
-        Directory.CreateDirectory("logs/filesystem");
+        AnsiConsole.WriteLine($"[DEBUG] Creating log directories");
+        CreateLogDirectories();
+        AnsiConsole.WriteLine($"[DEBUG] Log directories created at: {Path.GetFullPath("logs")}");
 
-        // File target
+        // Main structured log file
         var fileTarget = new FileTarget("fileTarget")
         {
             FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.log",
-            Layout = "${longdate} [${level:uppercase=true}] ${logger} - ${message} ${exception:format=tostring}",
+            Layout = "${longdate} [${level:uppercase=true}] ${logger} | ${message} | thread=${threadid} user=${environment-user} machine=${machinename} ${exception:format=tostring}",
             ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.log",
+            ArchiveEvery = FileArchivePeriod.Day,
+            MaxArchiveFiles = 30,
+            KeepFileOpen = false,
+            Encoding = System.Text.Encoding.UTF8
+        };
+        
+        // JSON structured log file
+        var jsonTarget = new FileTarget("jsonTarget")
+        {
+            FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.json",
+            Layout = "${json-encode}",
+            ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.json",
+            ArchiveEvery = FileArchivePeriod.Day,
+            MaxArchiveFiles = 30,
+            KeepFileOpen = false,
+            Encoding = System.Text.Encoding.UTF8
+        };
+        
+        // TOML structured log file
+        var tomlTarget = new TomlFileTarget
+        {
+            Name = "tomlTarget",
+            FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.toml",
+            ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.toml",
             ArchiveEvery = FileArchivePeriod.Day,
             MaxArchiveFiles = 30,
             KeepFileOpen = false,
@@ -279,25 +413,48 @@ public static class LoggingConfiguration
             ForegroundColor = ConsoleOutputColor.Red
         });
 
-        // Error target
-        var errorTarget = new FileTarget("errorTarget")
-        {
-            FileName = "logs/errors/autodesk-cleaner-errors-${date:format=yyyy-MM-dd}.log",
-            Layout = "${longdate} [${level:uppercase=true}] ${logger} - ${message} ${exception:format=tostring}",
-            ArchiveFileName = "logs/archive/errors/autodesk-cleaner-errors-{#}.log",
-            ArchiveEvery = FileArchivePeriod.Day,
-            MaxArchiveFiles = 90
-        };
-
         config.AddTarget(fileTarget);
+        config.AddTarget(jsonTarget);
+        config.AddTarget(tomlTarget);
         config.AddTarget(consoleTarget);
-        config.AddTarget(errorTarget);
 
-        // Add rules
-        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Debug, fileTarget));
-        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Info, consoleTarget));
-        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Error, errorTarget));
+        // Add rules for simplified logging
+        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Info, fileTarget));
+        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Info, jsonTarget));
+        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Info, tomlTarget));
+        config.LoggingRules.Add(new LoggingRule("*", LogLevel.Debug, consoleTarget));
 
         LogManager.Configuration = config;
+        
+        // Test file logging immediately
+        AnsiConsole.WriteLine($"[DEBUG] Testing default file logging...");
+        var logger = LogManager.GetCurrentClassLogger();
+        logger.Info("DEFAULT FILE LOGGING TEST - This should appear in log files");
+        logger.Error("DEFAULT ERROR LOGGING TEST - This should appear in log files");
+        
+        // Force flush to ensure files are written
+        AnsiConsole.WriteLine($"[DEBUG] Flushing default log files...");
+        LogManager.Flush();
+        
+        // Debug: Check if files were created
+        var logDir = Path.GetFullPath("logs");
+        var logFiles = Directory.GetFiles(logDir, "*.log", SearchOption.AllDirectories);
+        AnsiConsole.WriteLine($"[DEBUG] Default log files found: {logFiles.Length}");
+        foreach (var file in logFiles)
+        {
+            AnsiConsole.WriteLine($"[DEBUG] - {file} ({new FileInfo(file).Length} bytes)");
+        }
+        
+        // Force a manual file write test
+        try
+        {
+            var testFile = "logs/manual-test.txt";
+            File.WriteAllText(testFile, $"Manual file write test at {DateTime.Now}");
+            AnsiConsole.WriteLine($"[DEBUG] Manual file write successful: {Path.GetFullPath(testFile)}");
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.WriteLine($"[DEBUG] Manual file write failed: {ex.Message}");
+        }
     }
 }

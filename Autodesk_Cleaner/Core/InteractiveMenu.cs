@@ -371,36 +371,62 @@ public sealed class InteractiveMenu : IDisposable
     /// <returns>True if confirmed.</returns>
     private static bool PerformBasicConfirmation(MenuOption option)
     {
-        var confirmationPanel = new Panel(new Markup(
-            $"[bold yellow]CONFIRMATION REQUIRED: {option}[/]\n\n" +
-            $"You have selected: [bold]{GetOperationDescription(option)}[/]\n\n" +
-            "[red]Do you want to proceed?[/]\n" +
-            "[dim](Type 'YES' to confirm, anything else to cancel)[/]"))
+        const int maxAttempts = 3;
+        
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            Border = BoxBorder.Double,
-            BorderStyle = new Style(Color.Yellow),
-            Header = new PanelHeader(" [bold yellow]CONFIRMATION REQUIRED[/] "),
-        };
-        
-        AnsiConsole.Write(confirmationPanel);
-        
-        var response = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold yellow]Your response:[/]")
-                .PromptStyle("yellow")
-                .AllowEmpty());
-        
-        var confirmed = string.Equals(response?.Trim(), "YES", StringComparison.OrdinalIgnoreCase);
-        
-        if (confirmed)
-        {
-            AnsiConsole.MarkupLine("[bold green]Basic confirmation: PASSED[/]");
-        }
-        else
-        {
+            var confirmationPanel = new Panel(new Markup(
+                $"[bold yellow]CONFIRMATION REQUIRED: {option}[/]\n\n" +
+                $"You have selected: [bold]{GetOperationDescription(option)}[/]\n\n" +
+                "[red]Do you want to proceed?[/]\n" +
+                "[dim](Type 'YES' to confirm, anything else to cancel)[/]" +
+                (attempt > 1 ? $"\n[dim](Attempt {attempt} of {maxAttempts})[/]" : "")))
+            {
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Yellow),
+                Header = new PanelHeader(" [bold yellow]CONFIRMATION REQUIRED[/] "),
+            };
+            
+            AnsiConsole.Write(confirmationPanel);
+            
+            var response = AnsiConsole.Prompt(
+                new TextPrompt<string>("[bold yellow]Your response:[/]")
+                    .PromptStyle("yellow")
+                    .AllowEmpty());
+            
+            var confirmed = string.Equals(response?.Trim(), "YES", StringComparison.OrdinalIgnoreCase);
+            
+            if (confirmed)
+            {
+                AnsiConsole.MarkupLine("[bold green]Basic confirmation: PASSED[/]");
+                return true;
+            }
+            
+            // Check if user explicitly wants to cancel
+            var normalizedResponse = response?.Trim().ToUpperInvariant() ?? string.Empty;
+            if (normalizedResponse == "NO" || normalizedResponse == "CANCEL" || normalizedResponse == "EXIT")
+            {
+                AnsiConsole.MarkupLine("[bold red]Basic confirmation: CANCELLED by user[/]");
+                return false;
+            }
+            
             AnsiConsole.MarkupLine("[bold red]Basic confirmation: FAILED[/]");
+            
+            if (attempt < maxAttempts)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Please type 'YES' to confirm or 'NO' to cancel. ({maxAttempts - attempt} attempts remaining)[/]");
+                AnsiConsole.MarkupLine($"[dim]You typed: '{response?.Trim()}'[/]");
+                AnsiConsole.MarkupLine("\n[dim]Press any key to continue...[/]");
+                Console.ReadKey(true);
+                Console.Clear();
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[bold red]Maximum attempts ({maxAttempts}) exceeded.[/]");
+            }
         }
         
-        return confirmed;
+        return false;
     }
 
     /// <summary>
@@ -410,39 +436,62 @@ public sealed class InteractiveMenu : IDisposable
     /// <returns>True if risk is acknowledged.</returns>
     private static bool PerformRiskAcknowledgment(MenuOption option)
     {
+        const int maxAttempts = 3;
+        const string requiredPhrase = "I ACKNOWLEDGE THE RISKS";
+        
         var risks = GetOperationRisks(option);
-        var riskList = string.Join("\n", risks.Select(risk => $"[bold red][!] {risk}"));
+        var riskList = string.Join("\n", risks.Select(risk => $"[bold red]• {risk}[/]"));
         
-        var riskPanel = new Panel(new Markup(
-            "[bold red]RISK ACKNOWLEDGMENT REQUIRED[/]\n\n" +
-            "The following risks have been identified:\n\n" +
-            riskList + "\n\n" +
-            "[bold yellow]Type 'I ACKNOWLEDGE THE RISKS' to proceed:[/]"))
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            Border = BoxBorder.Double,
-            BorderStyle = new Style(Color.Red),
-            Header = new PanelHeader(" [bold red]RISK ASSESSMENT[/] "),
-        };
-        
-        AnsiConsole.Write(riskPanel);
-        
-        var response = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold red]Your response:[/]")
-                .PromptStyle("red")
-                .AllowEmpty());
-        
-        var acknowledged = string.Equals(response?.Trim(), "I ACKNOWLEDGE THE RISKS", StringComparison.OrdinalIgnoreCase);
-        
-        if (acknowledged)
-        {
-            AnsiConsole.MarkupLine("[bold green]Risk acknowledgment: PASSED[/]");
-        }
-        else
-        {
+            var riskPanel = new Panel(new Markup(
+                "[bold red]RISK ACKNOWLEDGMENT REQUIRED[/]\n\n" +
+                "The following risks have been identified:\n\n" +
+                riskList + "\n\n" +
+                $"[bold yellow]Type '{requiredPhrase}' to proceed:[/]" +
+                (attempt > 1 ? $"\n[dim](Attempt {attempt} of {maxAttempts})[/]" : "")))
+            {
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Red),
+                Header = new PanelHeader(" [bold red]RISK ASSESSMENT[/] "),
+            };
+            
+            AnsiConsole.Write(riskPanel);
+            
+            var response = AnsiConsole.Prompt(
+                new TextPrompt<string>("[bold red]Your response:[/]")
+                    .PromptStyle("red")
+                    .AllowEmpty());
+            
+            // Allow both present and past tense, and be case insensitive
+            var normalizedResponse = response?.Trim().ToUpperInvariant() ?? string.Empty;
+            var acknowledged = normalizedResponse == "I ACKNOWLEDGE THE RISKS" || 
+                              normalizedResponse == "I ACKNOWLEDGED THE RISKS";
+            
+            if (acknowledged)
+            {
+                AnsiConsole.MarkupLine("[bold green]Risk acknowledgment: PASSED[/]");
+                return true;
+            }
+            
             AnsiConsole.MarkupLine("[bold red]Risk acknowledgment: FAILED[/]");
+            
+            if (attempt < maxAttempts)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Incorrect phrase. Please try again. ({maxAttempts - attempt} attempts remaining)[/]");
+                AnsiConsole.MarkupLine($"[dim]Required: '{requiredPhrase}'[/]");
+                AnsiConsole.MarkupLine($"[dim]You typed: '{response?.Trim()}'[/]");
+                AnsiConsole.MarkupLine("\n[dim]Press any key to continue...[/]");
+                Console.ReadKey(true);
+                Console.Clear();
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[bold red]Maximum attempts ({maxAttempts}) exceeded.[/]");
+            }
         }
         
-        return acknowledged;
+        return false;
     }
 
     /// <summary>
@@ -452,47 +501,68 @@ public sealed class InteractiveMenu : IDisposable
     /// <returns>True if administratively confirmed.</returns>
     private static bool PerformAdministrativeConfirmation(MenuOption option)
     {
-        var adminInfo = new Table()
+        const int maxAttempts = 3;
+        const string requiredPhrase = "ADMIN CONFIRMED";
+        
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            Border = TableBorder.None
-        };
-        adminInfo.AddColumn("[bold]Field[/]");
-        adminInfo.AddColumn("[bold]Value[/]");
-        adminInfo.AddRow("Current User", Environment.UserName);
-        adminInfo.AddRow("Current Time", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " UTC");
-        adminInfo.AddRow("Operation", option.ToString());
-        
-        var adminText = new Markup(
-            "[bold magenta]ADMINISTRATIVE CONFIRMATION REQUIRED[/]\n\n" +
-            "As an administrator, you must provide additional confirmation.\n" +
-            "This operation will be logged with your user context for audit purposes.\n\n");
-        
-        var adminPanel = new Panel(new Rows(adminText, adminInfo, new Markup("\n[bold yellow]Type 'ADMIN CONFIRMED' to proceed:[/]")))
-        {
-            Border = BoxBorder.Double,
-            BorderStyle = new Style(Color.Purple),
-            Header = new PanelHeader(" [bold magenta]ADMINISTRATIVE VERIFICATION[/] "),
-        };
-        
-        AnsiConsole.Write(adminPanel);
-        
-        var response = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold magenta]Your response:[/]")
-                .PromptStyle("magenta")
-                .AllowEmpty());
-        
-        var confirmed = string.Equals(response?.Trim(), "ADMIN CONFIRMED", StringComparison.OrdinalIgnoreCase);
-        
-        if (confirmed)
-        {
-            AnsiConsole.MarkupLine("[bold green]Administrative confirmation: PASSED[/]");
-        }
-        else
-        {
+            var adminInfo = new Table()
+            {
+                Border = TableBorder.None
+            };
+            adminInfo.AddColumn("[bold]Field[/]");
+            adminInfo.AddColumn("[bold]Value[/]");
+            adminInfo.AddRow("Current User", Environment.UserName);
+            adminInfo.AddRow("Current Time", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " UTC");
+            adminInfo.AddRow("Operation", option.ToString());
+            
+            var adminText = new Markup(
+                "[bold magenta]ADMINISTRATIVE CONFIRMATION REQUIRED[/]\n\n" +
+                "As an administrator, you must provide additional confirmation.\n" +
+                "This operation will be logged with your user context for audit purposes.\n\n");
+            
+            var adminPanel = new Panel(new Rows(adminText, adminInfo, new Markup(
+                $"\n[bold yellow]Type '{requiredPhrase}' to proceed:[/]" +
+                (attempt > 1 ? $"\n[dim](Attempt {attempt} of {maxAttempts})[/]" : ""))))
+            {
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Purple),
+                Header = new PanelHeader(" [bold magenta]ADMINISTRATIVE VERIFICATION[/] "),
+            };
+            
+            AnsiConsole.Write(adminPanel);
+            
+            var response = AnsiConsole.Prompt(
+                new TextPrompt<string>("[bold magenta]Your response:[/]")
+                    .PromptStyle("magenta")
+                    .AllowEmpty());
+            
+            var confirmed = string.Equals(response?.Trim(), requiredPhrase, StringComparison.OrdinalIgnoreCase);
+            
+            if (confirmed)
+            {
+                AnsiConsole.MarkupLine("[bold green]Administrative confirmation: PASSED[/]");
+                return true;
+            }
+            
             AnsiConsole.MarkupLine("[bold red]Administrative confirmation: FAILED[/]");
+            
+            if (attempt < maxAttempts)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Incorrect phrase. Please try again. ({maxAttempts - attempt} attempts remaining)[/]");
+                AnsiConsole.MarkupLine($"[dim]Required: '{requiredPhrase}'[/]");
+                AnsiConsole.MarkupLine($"[dim]You typed: '{response?.Trim()}'[/]");
+                AnsiConsole.MarkupLine("\n[dim]Press any key to continue...[/]");
+                Console.ReadKey(true);
+                Console.Clear();
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[bold red]Maximum attempts ({maxAttempts}) exceeded.[/]");
+            }
         }
         
-        return confirmed;
+        return false;
     }
 
     /// <summary>
@@ -502,52 +572,79 @@ public sealed class InteractiveMenu : IDisposable
     /// <returns>True if cryptographic challenge is successful.</returns>
     private bool PerformCryptographicChallenge(MenuOption option)
     {
-        // Generate cryptographic challenge
-        var challengeBytes = new byte[8];
-        _cryptoRng.GetBytes(challengeBytes);
-        var challenge = Convert.ToHexString(challengeBytes).ToLowerInvariant();
+        const int maxAttempts = 3;
         
-        var cryptoPanel = new Panel(new Markup(
-            "[bold red]CRYPTOGRAPHIC VERIFICATION REQUIRED[/]\n\n" +
-            "For maximum security, you must complete a cryptographic challenge.\n\n" +
-            $"Please type the following hexadecimal string exactly:\n" +
-            $"[bold yellow on black] {challenge} [/]\n\n" +
-            "[dim]This ensures only authorized personnel can execute critical operations.[/]"))
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            Border = BoxBorder.Double,
-            BorderStyle = new Style(Color.Red),
-            Header = new PanelHeader(" [bold red]CRYPTOGRAPHIC CHALLENGE[/] "),
-        };
-        
-        AnsiConsole.Write(cryptoPanel);
-        
-        var response = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold red]Your response:[/]")
-                .PromptStyle("red")
-                .AllowEmpty())
-            .Trim().ToLowerInvariant();
-        
-        var verified = string.Equals(response, challenge, StringComparison.Ordinal);
-        
-        if (verified)
-        {
-            AnsiConsole.MarkupLine("[bold green]Cryptographic verification: PASSED[/]");
-        }
-        else
-        {
+            // Generate cryptographic challenge
+            var challengeBytes = new byte[8];
+            _cryptoRng.GetBytes(challengeBytes);
+            var challenge = Convert.ToHexString(challengeBytes).ToLowerInvariant();
+            
+            var cryptoPanel = new Panel(new Markup(
+                "[bold red]CRYPTOGRAPHIC VERIFICATION REQUIRED[/]\n\n" +
+                "For maximum security, you must complete a cryptographic challenge.\n\n" +
+                $"Please type the following hexadecimal string exactly:\n" +
+                $"[bold yellow on black] {challenge} [/]\n\n" +
+                "[dim]This ensures only authorized personnel can execute critical operations.[/]" +
+                (attempt > 1 ? $"\n\n[dim](Attempt {attempt} of {maxAttempts})[/]" : "")))
+            {
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Red),
+                Header = new PanelHeader(" [bold red]CRYPTOGRAPHIC CHALLENGE[/] "),
+            };
+            
+            AnsiConsole.Write(cryptoPanel);
+            
+            var response = AnsiConsole.Prompt(
+                new TextPrompt<string>("[bold red]Your response:[/]")
+                    .PromptStyle("red")
+                    .AllowEmpty())
+                .Trim().ToLowerInvariant();
+            
+            var verified = string.Equals(response, challenge, StringComparison.Ordinal);
+            
+            if (verified)
+            {
+                AnsiConsole.MarkupLine("[bold green]Cryptographic verification: PASSED[/]");
+                return true;
+            }
+            
             AnsiConsole.MarkupLine("[bold red]Cryptographic verification: FAILED[/]");
             
-            // Add delay to prevent brute force attempts
-            AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .SpinnerStyle(Style.Parse("red"))
-                .Start("[red]Security delay in effect...[/]", ctx => 
-                {
-                    Thread.Sleep(3000);
-                });
+            if (attempt < maxAttempts)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Incorrect string. Please try again. ({maxAttempts - attempt} attempts remaining)[/]");
+                AnsiConsole.MarkupLine($"[dim]Expected: '{challenge}'[/]");
+                AnsiConsole.MarkupLine($"[dim]You typed: '{response}'[/]");
+                
+                // Add delay to prevent brute force attempts
+                AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .SpinnerStyle(Style.Parse("red"))
+                    .Start("[red]Security delay in effect...[/]", ctx => 
+                    {
+                        Thread.Sleep(2000);
+                    });
+                    
+                Console.Clear();
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[bold red]Maximum attempts ({maxAttempts}) exceeded.[/]");
+                
+                // Longer delay after all attempts failed
+                AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .SpinnerStyle(Style.Parse("red"))
+                    .Start("[red]Security lockout in effect...[/]", ctx => 
+                    {
+                        Thread.Sleep(5000);
+                    });
+            }
         }
         
-        return verified;
+        return false;
     }
 
     /// <summary>

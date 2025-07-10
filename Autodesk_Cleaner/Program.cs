@@ -20,6 +20,14 @@ internal static class Program
     /// <returns>Exit code (0 for success, non-zero for error).</returns>
     private static async Task<int> Main(string[] args)
     {
+        // Check for debug mode
+        bool debugMode = args.Contains("--debug") || args.Contains("-d");
+        
+        if (debugMode)
+        {
+            return await RunDebugModeAsync();
+        }
+        
         try
         {
             // Initialize logging first
@@ -315,7 +323,7 @@ internal static class Program
         AnsiConsole.Write(new Rule("[bold green]CONFIGURATION UPDATED[/]"));
         DisplayCurrentBackupConfig(newConfig);
         
-        AnsiConsole.MarkupLine("[bold green]Backup configuration updated successfully![/]");
+        AnsiConsole.MarkupLine("[bold green]Backup configuration updated successfully[/]!");
         AnsiConsole.MarkupLine("[dim]Note: Configuration will be used for subsequent operations in this session.[/]");
     }
     
@@ -484,16 +492,25 @@ internal static class Program
             // Phase 1: Registry Cleanup
             AnsiConsole.Write(new Rule("[bold blue]Phase 1: Registry Cleanup[/]"));
             
-            var registryEntries = await AnsiConsole.Status()
-                .StartAsync("[green]Scanning registry for Autodesk entries...[/]", async ctx =>
-                {
-                    using var registryScanner = new AutodeskRegistryScanner(config);
-                    return await registryScanner.ScanRegistryAsync();
-                });
-                
-            AnsiConsole.MarkupLine($"[green]Found {registryEntries.Count} registry entries to clean.[/]");
+            AnsiConsole.MarkupLine("[green]Scanning registry for Autodesk entries...[/]");
+            IReadOnlyCollection<RegistryEntry> registryEntries;
+            using (var registryScanner = new AutodeskRegistryScanner(config))
+            {
+                registryEntries = await registryScanner.ScanRegistryAsync();
+            }
+            AnsiConsole.MarkupLine($"[green]Registry scan completed. Found {registryEntries.Count} raw entries.[/]");
 
+            // Check how many entries are actually valid for cleaning
+            var validRegistryCount = 0;
             if (registryEntries.Count > 0)
+            {
+                using var registryValidator = new AutodeskRegistryScanner(config);
+                validRegistryCount = registryValidator.GetValidEntryCount(registryEntries);
+            }
+                
+            AnsiConsole.MarkupLine($"[green]Found {validRegistryCount} registry entries to clean.[/]");
+
+            if (validRegistryCount > 0)
             {
                 DisplayRegistryResults(registryEntries);
                 
@@ -520,16 +537,25 @@ internal static class Program
             // Phase 2: File System Cleanup
             AnsiConsole.Write(new Rule("[bold blue]Phase 2: File System Cleanup[/]"));
             
-            var fileSystemEntries = await AnsiConsole.Status()
-                .StartAsync("[green]Scanning file system for Autodesk files and directories...[/]", async ctx =>
-                {
-                    using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
-                    return await fileSystemCleaner.ScanFileSystemAsync();
-                });
-                
-            AnsiConsole.MarkupLine($"[green]Found {fileSystemEntries.Count} file system entries to clean.[/]");
+            AnsiConsole.MarkupLine("[green]Scanning file system for Autodesk files and directories...[/]");
+            IReadOnlyCollection<FileSystemEntry> fileSystemEntries;
+            using (var fileSystemCleaner = new AutodeskFileSystemCleaner(config))
+            {
+                fileSystemEntries = await fileSystemCleaner.ScanFileSystemAsync();
+            }
+            AnsiConsole.MarkupLine($"[green]File system scan completed. Found {fileSystemEntries.Count} raw entries.[/]");
 
+            // Check how many entries are actually valid for cleaning
+            var validFileSystemCount = 0;
             if (fileSystemEntries.Count > 0)
+            {
+                using var fileSystemValidator = new AutodeskFileSystemCleaner(config);
+                validFileSystemCount = fileSystemValidator.GetValidEntryCount(fileSystemEntries);
+            }
+                
+            AnsiConsole.MarkupLine($"[green]Found {validFileSystemCount} file system entries to clean.[/]");
+
+            if (validFileSystemCount > 0)
             {
                 DisplayFileSystemResults(fileSystemEntries);
                 
@@ -639,7 +665,7 @@ internal static class Program
         else if (overallSuccess)
         {
             summaryPanel = new Panel(new Markup(
-                "[bold green]Autodesk cleanup completed successfully![/]\n\n" +
+                "[bold green]Autodesk cleanup completed successfully[/]!\n\n" +
                 "All Autodesk registry entries and files have been removed from your system.\n" +
                 "You can now proceed with a fresh installation of Autodesk products."))
             {
@@ -703,6 +729,80 @@ internal static class Program
         }
     }
 
+    /// <summary>
+    /// Runs the application in debug mode without Spectre.Console.
+    /// </summary>
+    /// <returns>Exit code.</returns>
+#pragma warning disable Spectre1000 // Use AnsiConsole instead of System.Console
+    private static async Task<int> RunDebugModeAsync()
+    {
+        Console.WriteLine("=== AUTODESK CLEANER DEBUG MODE ===");
+        Console.WriteLine($"Current Directory: {Environment.CurrentDirectory}");
+        Console.WriteLine($"Application Directory: {AppDomain.CurrentDomain.BaseDirectory}");
+        
+        Console.WriteLine("\n=== INITIALIZING LOGGING ===");
+        
+        // Initialize logging with debug output
+        LoggingConfiguration.InitializeLogging();
+        var logger = LogManager.GetCurrentClassLogger();
+        
+        Console.WriteLine("\n=== TESTING LOGGING ===");
+        logger.Info("DEBUG MODE: Testing Info level logging");
+        logger.Error("DEBUG MODE: Testing Error level logging");
+        logger.Debug("DEBUG MODE: Testing Debug level logging");
+        
+        Console.WriteLine("\n=== CHECKING LOG DIRECTORIES ===");
+        var logPaths = new[]
+        {
+            "logs",
+            "logs/archive"
+        };
+        
+        foreach (var path in logPaths)
+        {
+            var fullPath = Path.GetFullPath(path);
+            var exists = Directory.Exists(fullPath);
+            Console.WriteLine($"Directory {path}: {(exists ? "EXISTS" : "MISSING")} ({fullPath})");
+            
+            if (exists)
+            {
+                var files = Directory.GetFiles(fullPath, "*", SearchOption.TopDirectoryOnly);
+                Console.WriteLine($"  Files in directory: {files.Length}");
+                foreach (var file in files.Take(5))
+                {
+                    var fileInfo = new FileInfo(file);
+                    Console.WriteLine($"    {Path.GetFileName(file)} ({fileInfo.Length} bytes, {fileInfo.LastWriteTime})");
+                }
+            }
+        }
+        
+        Console.WriteLine("\n=== TESTING REGISTRY SCANNER ===");
+        try
+        {
+            using var scanner = new AutodeskRegistryScanner();
+            var entries = await scanner.ScanRegistryAsync();
+            Console.WriteLine($"Found {entries.Count} registry entries");
+            
+            if (entries.Count > 0)
+            {
+                Console.WriteLine("\n=== TESTING VALIDATION ===");
+                var isValid = scanner.ValidateEntries(entries);
+                Console.WriteLine($"Validation result: {isValid}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Registry scanner error: {ex.Message}");
+        }
+        
+        Console.WriteLine("\n=== DEBUG MODE COMPLETE ===");
+        Console.WriteLine("Press any key to exit...");
+        Console.ReadKey();
+        
+        return 0;
+    }
+#pragma warning restore Spectre1000
+    
     /// <summary>
     /// Formats a file size into a human-readable string.
     /// </summary>
