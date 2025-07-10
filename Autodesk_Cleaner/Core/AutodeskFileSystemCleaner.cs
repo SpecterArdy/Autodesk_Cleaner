@@ -1,8 +1,9 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.IO.Abstractions;
 using System.Text.RegularExpressions;
 using NLog;
-
+using Spectre.Console;
 namespace Autodesk_Cleaner.Core;
 
 /// <summary>
@@ -160,7 +161,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 if (_config.DryRun)
                 {
-                    Console.WriteLine($"[DRY RUN] Would remove: {entry.Path}");
+                    AnsiConsole.MarkupLine($"[dim][DRY RUN] Would remove: {entry.Path}[/]");
                     successfulRemovals++;
                     continue;
                 }

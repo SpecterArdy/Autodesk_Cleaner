@@ -29,6 +29,11 @@
     <ItemGroup>
       <PackageReference Include="Microsoft.Win32.Registry.AccessControl" Version="10.0.0-preview.5.25277.114" />
       <PackageReference Include="NLog" Version="6.0.1" />
+      <PackageReference Include="Spectre.Console" Version="0.50.1-preview.0.20" />
+      <PackageReference Include="Spectre.Console.Analyzer" Version="1.0.0">
+        <PrivateAssets>all</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      </PackageReference>
       <PackageReference Include="System.IO.Abstractions" Version="22.0.15" />
       <PackageReference Include="Tomlyn" Version="0.19.0" />
     </ItemGroup>

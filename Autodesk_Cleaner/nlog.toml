@@ -30,28 +30,6 @@ encoding = "utf-8"
 name = "consoleTarget"
 type = "ColoredConsole"
 layout = "${time} [${level:uppercase=true:padding=-5}] ${message} ${exception:format=shorttype}"
-useDefaultRowHighlightingRules = false
-
-# Console color rules
-[[NLog.targets.consoleTarget.highlight]]
-condition = "level == LogLevel.Debug"
-foregroundColor = "DarkGray"
-
-[[NLog.targets.consoleTarget.highlight]]
-condition = "level == LogLevel.Info"
-foregroundColor = "Gray"
-
-[[NLog.targets.consoleTarget.highlight]]
-condition = "level == LogLevel.Warn"
-foregroundColor = "Yellow"
-
-[[NLog.targets.consoleTarget.highlight]]
-condition = "level == LogLevel.Error"
-foregroundColor = "Red"
-
-[[NLog.targets.consoleTarget.highlight]]
-condition = "level == LogLevel.Fatal"
-foregroundColor = "Magenta"
 
 # Operation-specific file target for detailed operation logs
 [[NLog.targets]]

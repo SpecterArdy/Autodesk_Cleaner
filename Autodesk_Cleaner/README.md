@@ -2,7 +2,7 @@
 
 A modular, high-integrity tool for completely removing all Autodesk products from Windows systems. This tool is designed for situations where you need to perform a clean uninstall before reinstalling Autodesk products.
 
-## ⚠️ Important Safety Warning
+## Important Safety Warning
 
 **THIS TOOL WILL PERMANENTLY DELETE ALL AUTODESK SOFTWARE AND DATA FROM YOUR SYSTEM**
 

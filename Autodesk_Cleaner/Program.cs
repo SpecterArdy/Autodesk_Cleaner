@@ -1,17 +1,17 @@
 using Autodesk_Cleaner.Core;
 using System.Security.Principal;
 using NLog;
+using Spectre.Console;
 
 namespace Autodesk_Cleaner;
 
-/// <summary>
+/// csummarye
 /// Main entry point for the Autodesk Registry Cleaner console application.
-/// </summary>
+/// c/summarye
 internal static class Program
 {
-    private static readonly ConsoleColor OriginalForegroundColor = Console.ForegroundColor;
-    private static readonly ConsoleColor OriginalBackgroundColor = Console.BackgroundColor;
     private static Logger? _logger;
+    private static ScannerConfig _currentConfig = ScannerConfig.Default;
 
     /// <summary>
     /// Main entry point for the application.
@@ -26,55 +26,76 @@ internal static class Program
             LoggingConfiguration.InitializeLogging();
             _logger = LogManager.GetCurrentClassLogger();
             
-            Console.Title = "Autodesk Registry Cleaner v1.0.0";
+            AnsiConsole.MarkupLine("[bold blue]Autodesk Registry Cleaner v1.0.0[/]");
             
-            _logger.Info("Application started with arguments: {@Args}", args);
-            
-            WriteHeader();
+            _logger.Info("Application started with interactive menu");
             
             // Check for administrator privileges
             if (!IsRunningAsAdministrator())
             {
                 _logger.Error("Application not running as Administrator");
-                WriteError("This application must be run as Administrator to modify registry and system files.");
-                WriteWarning("Please restart the application with administrator privileges.");
-                WriteInfo("Press any key to exit...");
+                
+                var errorPanel = new Panel(new Markup(
+                    "[bold red]ADMINISTRATOR PRIVILEGES REQUIRED[/]\n\n" +
+                    "This application must be run as Administrator to modify registry and system files.\n" +
+                    "Please restart the application with administrator privileges."))
+                {
+                    Header = new PanelHeader(" [bold red]ACCESS DENIED[/] "),
+                    Border = BoxBorder.Double,
+                    BorderStyle = new Style(Color.Red)
+                };
+                
+                AnsiConsole.Write(errorPanel);
+                AnsiConsole.MarkupLine("\n[dim]Press any key to exit...[/]");
                 Console.ReadKey();
                 return 1;
             }
             
             _logger.Info("Administrator privileges confirmed");
 
-            // Parse command line arguments
-            var config = ParseArguments(args);
-            _logger.Info("Configuration parsed: {@Config}", config);
+            using var menu = new InteractiveMenu();
             
-            // Display configuration
-            DisplayConfiguration(config);
-            
-            // Get user confirmation
-            if (!config.DryRun && !GetUserConfirmation())
+            while (true)
             {
-                _logger.Info("Operation cancelled by user");
-                WriteInfo("Operation cancelled by user.");
-                return 0;
+                var option = menu.DisplayMainMenu();
+                
+                if (option == InteractiveMenu.MenuOption.Exit)
+                {
+                    _logger.Info("Exiting application");
+                    break;
+                }
+                
+                var exitCode = await HandleMenuOptionAsync(option);
+                if (exitCode != 0)
+                {
+                    return exitCode;
+                }
             }
 
-            // Execute the cleaning operation
-            var exitCode = await ExecuteCleaningOperationAsync(config);
-            
-            WriteInfo("Press any key to exit...");
-            Console.ReadKey();
-            
-            return exitCode;
+            return 0;
         }
         catch (Exception ex)
         {
             _logger?.Fatal(ex, "Critical error in main application");
-            WriteError($"Critical error: {ex.Message}");
-            WriteError(ex.StackTrace ?? "No stack trace available");
             
-            WriteInfo("Press any key to exit...");
+            var errorPanel = new Panel(new Markup(
+                $"[bold red]CRITICAL ERROR[/]\n\n" +
+                $"An unexpected error occurred: [yellow]{ex.Message}[/]\n\n" +
+                "[dim]Check the logs for more detailed information.[/]"))
+            {
+                Header = new PanelHeader(" [bold red]FATAL ERROR[/] "),
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Red)
+            };
+            
+            AnsiConsole.Write(errorPanel);
+            
+            if (_logger != null)
+            {
+                AnsiConsole.MarkupLine("[dim]Full stack trace has been logged for debugging.[/]");
+            }
+            
+            AnsiConsole.MarkupLine("\n[dim]Press any key to exit...[/]");
             Console.ReadKey();
             
             return -1;
@@ -83,13 +104,360 @@ internal static class Program
         {
             _logger?.Info("Application shutdown");
             LogManager.Shutdown();
-            
-            // Restore original console colors
-            Console.ForegroundColor = OriginalForegroundColor;
-            Console.BackgroundColor = OriginalBackgroundColor;
         }
     }
 
+    /// <summary>
+    /// Handles the selected menu option.
+    /// </summary>
+    /// <param name="option">The selected menu option.</param>
+    /// <returns>Exit code (0 for continue, non-zero for exit).</returns>
+    private static async Task<int> HandleMenuOptionAsync(InteractiveMenu.MenuOption option)
+    {
+        try
+        {
+            switch (option)
+            {
+                case InteractiveMenu.MenuOption.ScanRegistryOnly:
+                    await HandleScanRegistryAsync();
+                    break;
+                case InteractiveMenu.MenuOption.ScanFileSystemOnly:
+                    await HandleScanFileSystemAsync();
+                    break;
+                case InteractiveMenu.MenuOption.ScanBoth:
+                    await HandleScanBothAsync();
+                    break;
+                case InteractiveMenu.MenuOption.DryRunCleanup:
+                    await HandleDryRunCleanupAsync();
+                    break;
+                case InteractiveMenu.MenuOption.ActualCleanup:
+                    await HandleActualCleanupAsync();
+                    break;
+                case InteractiveMenu.MenuOption.ConfigureBackup:
+                    HandleConfigureBackup();
+                    break;
+                case InteractiveMenu.MenuOption.ViewConfiguration:
+                    HandleViewConfiguration();
+                    break;
+                case InteractiveMenu.MenuOption.EmergencyAbort:
+                    _logger?.Warn("Emergency abort triggered by user");
+                    AnsiConsole.MarkupLine("[bold red]Emergency abort initiated. Exiting immediately.[/]");
+                    return -1;
+                default:
+                    _logger?.Warn("Unknown menu option selected: {Option}", option);
+                    AnsiConsole.MarkupLine("[red]Unknown option selected.[/]");
+                    break;
+            }
+            
+            // Pause after each operation
+            AnsiConsole.MarkupLine("\n[dim]Press any key to return to main menu...[/]");
+            Console.ReadKey(true);
+            
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Error handling menu option: {Option}", option);
+            AnsiConsole.WriteException(ex);
+            return 0; // Return to menu instead of exiting
+        }
+    }
+    
+    /// <summary>
+    /// Handles scanning registry only.
+    /// </summary>
+    private static async Task HandleScanRegistryAsync()
+    {
+        var config = _currentConfig with { DryRun = true };
+        
+        await AnsiConsole.Status()
+            .StartAsync("[green]Scanning registry for Autodesk entries...[/]", async ctx =>
+            {
+                using var scanner = new AutodeskRegistryScanner(config);
+                var entries = await scanner.ScanRegistryAsync();
+                
+                ctx.Status("Creating registry report...");
+                DisplayRegistryResults(entries);
+            });
+    }
+    
+    /// <summary>
+    /// Handles scanning file system only.
+    /// </summary>
+    private static async Task HandleScanFileSystemAsync()
+    {
+        var config = _currentConfig with { DryRun = true };
+        
+        await AnsiConsole.Status()
+            .StartAsync("[green]Scanning file system for Autodesk files...[/]", async ctx =>
+            {
+                using var cleaner = new AutodeskFileSystemCleaner(config);
+                var entries = await cleaner.ScanFileSystemAsync();
+                
+                ctx.Status("Creating file system report...");
+                DisplayFileSystemResults(entries);
+            });
+    }
+    
+    /// <summary>
+    /// Handles scanning both registry and file system.
+    /// </summary>
+    private static async Task HandleScanBothAsync()
+    {
+        var config = _currentConfig with { DryRun = true };
+        
+        await AnsiConsole.Status()
+            .StartAsync("[green]Performing comprehensive scan...[/]", async ctx =>
+            {
+                ctx.Status("Scanning registry...");
+                using var registryScanner = new AutodeskRegistryScanner(config);
+                var registryEntries = await registryScanner.ScanRegistryAsync();
+                
+                ctx.Status("Scanning file system...");
+                using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
+                var fileSystemEntries = await fileSystemCleaner.ScanFileSystemAsync();
+                
+                ctx.Status("Generating comprehensive report...");
+                
+                AnsiConsole.Write(new Rule("[bold blue]COMPREHENSIVE SCAN RESULTS[/]"));
+                DisplayRegistryResults(registryEntries);
+                DisplayFileSystemResults(fileSystemEntries);
+            });
+    }
+    
+    /// <summary>
+    /// Handles dry run cleanup operation.
+    /// </summary>
+    private static async Task HandleDryRunCleanupAsync()
+    {
+        var config = _currentConfig with { DryRun = true };
+        await ExecuteCleaningOperationAsync(config);
+    }
+    
+    /// <summary>
+    /// Handles actual cleanup operation.
+    /// </summary>
+    private static async Task HandleActualCleanupAsync()
+    {
+        var config = _currentConfig with { DryRun = false };
+        await ExecuteCleaningOperationAsync(config);
+    }
+    
+    /// <summary>
+    /// Handles backup configuration.
+    /// </summary>
+    private static void HandleConfigureBackup()
+    {
+        var currentConfig = _currentConfig;
+        
+        // Display current configuration
+        DisplayCurrentBackupConfig(currentConfig);
+        
+        // Interactive configuration editing
+        var createBackup = AnsiConsole.Confirm(
+            "Do you want to create backups before cleanup operations?", 
+            currentConfig.CreateBackup);
+        
+        string backupPath = currentConfig.BackupPath;
+        if (createBackup)
+        {
+            backupPath = AnsiConsole.Ask(
+                "Enter backup directory path:", 
+                currentConfig.BackupPath);
+            
+            // Validate and create backup directory
+            try
+            {
+                if (!Directory.Exists(backupPath))
+                {
+                    var createDir = AnsiConsole.Confirm(
+                        $"Directory '{backupPath}' does not exist. Create it?");
+                    
+                    if (createDir)
+                    {
+                        Directory.CreateDirectory(backupPath);
+                        AnsiConsole.MarkupLine($"[green]Created backup directory: {backupPath}[/]");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine("[yellow]Backup path not created. Using default.[/]");
+                        backupPath = currentConfig.BackupPath;
+                    }
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine($"[green]Backup directory exists: {backupPath}[/]");
+                }
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Error creating backup directory: {ex.Message}[/]");
+                AnsiConsole.MarkupLine("[yellow]Using default backup path.[/]");
+                backupPath = currentConfig.BackupPath;
+            }
+        }
+        
+        var maxDepth = AnsiConsole.Ask(
+            "Maximum directory scan depth:", 
+            currentConfig.MaxDepth);
+        
+        // Create new configuration
+        var newConfig = currentConfig with 
+        {
+            CreateBackup = createBackup,
+            BackupPath = backupPath,
+            MaxDepth = maxDepth
+        };
+        
+        // Store the configuration for future use (in a real implementation, this would be persisted)
+        _currentConfig = newConfig;
+        
+        AnsiConsole.Write(new Rule("[bold green]CONFIGURATION UPDATED[/]"));
+        DisplayCurrentBackupConfig(newConfig);
+        
+        AnsiConsole.MarkupLine("[bold green]Backup configuration updated successfully![/]");
+        AnsiConsole.MarkupLine("[dim]Note: Configuration will be used for subsequent operations in this session.[/]");
+    }
+    
+    /// <summary>
+    /// Displays the current backup configuration.
+    /// </summary>
+    /// <param name="config">The configuration to display.</param>
+    private static void DisplayCurrentBackupConfig(ScannerConfig config)
+    {
+        var table = new Table();
+        table.AddColumn("[bold]Setting[/]");
+        table.AddColumn("[bold]Current Value[/]");
+        table.AddColumn("[bold]Description[/]");
+        
+        table.AddRow("Create Backup", config.CreateBackup ? "[green]Yes[/]" : "[red]No[/]", "Create registry/file backups before deletion");
+        table.AddRow("Backup Path", $"[yellow]{config.BackupPath}[/]", "Location where backups are stored");
+        table.AddRow("Max Depth", config.MaxDepth.ToString(), "Maximum directory depth for file scanning");
+        table.AddRow("Include User Registry", config.IncludeUserHive ? "[green]Yes[/]" : "[red]No[/]", "Scan user registry (HKEY_CURRENT_USER)");
+        table.AddRow("Include System Registry", config.IncludeLocalMachine ? "[green]Yes[/]" : "[red]No[/]", "Scan system registry (HKEY_LOCAL_MACHINE)");
+        
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader(" [bold blue]CURRENT BACKUP CONFIGURATION[/] "),
+            Border = BoxBorder.Rounded
+        };
+        
+        AnsiConsole.Write(panel);
+    }
+    
+    /// <summary>
+    /// Handles viewing current configuration.
+    /// </summary>
+    private static void HandleViewConfiguration()
+    {
+        var config = _currentConfig;
+        
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = new Style(Color.Blue)
+        };
+        
+        table.AddColumn("[bold]Configuration Item[/]");
+        table.AddColumn("[bold]Value[/]");
+        table.AddColumn("[bold]Description[/]");
+        
+        table.AddRow("Dry Run Mode", config.DryRun ? "[green]Enabled[/]" : "[red]Disabled[/]", "Preview changes without making them");
+        table.AddRow("Create Backup", config.CreateBackup ? "[green]Enabled[/]" : "[red]Disabled[/]", "Create backups before deletion");
+        table.AddRow("Backup Path", $"[yellow]{config.BackupPath}[/]", "Backup storage location");
+        table.AddRow("Include User Registry", config.IncludeUserHive ? "[green]Yes[/]" : "[red]No[/]", "Scan HKEY_CURRENT_USER");
+        table.AddRow("Include System Registry", config.IncludeLocalMachine ? "[green]Yes[/]" : "[red]No[/]", "Scan HKEY_LOCAL_MACHINE");
+        table.AddRow("Max Scan Depth", config.MaxDepth.ToString(), "Maximum directory depth");
+        
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader(" [bold blue]CURRENT CONFIGURATION[/] "),
+            Border = BoxBorder.Double
+        };
+        
+        AnsiConsole.Write(panel);
+    }
+    
+    /// <summary>
+    /// Displays registry scan results.
+    /// </summary>
+    /// <param name="entries">Registry entries found.</param>
+    private static void DisplayRegistryResults(IReadOnlyCollection<RegistryEntry> entries)
+    {
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = new Style(Color.Green)
+        };
+        
+        table.AddColumn("[bold]Registry Key[/]");
+        table.AddColumn("[bold]Display Name[/]");
+        table.AddColumn("[bold]Type[/]");
+        
+        foreach (var entry in entries.Take(20)) // Show first 20
+        {
+            table.AddRow(
+                $"[dim]{entry.KeyPath}[/]",
+                entry.DisplayName ?? "[dim]N/A[/]",
+                $"[yellow]{entry.EntryType}[/]"
+            );
+        }
+        
+        if (entries.Count > 20)
+        {
+            table.AddRow($"[dim]... and {entries.Count - 20} more entries[/]", "", "");
+        }
+        
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader($" [bold green]REGISTRY SCAN RESULTS ({entries.Count} entries)[/] ")
+        };
+        
+        AnsiConsole.Write(panel);
+    }
+    
+    /// <summary>
+    /// Displays file system scan results.
+    /// </summary>
+    /// <param name="entries">File system entries found.</param>
+    private static void DisplayFileSystemResults(IReadOnlyCollection<FileSystemEntry> entries)
+    {
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = new Style(Color.Blue)
+        };
+        
+        table.AddColumn("[bold]Path[/]");
+        table.AddColumn("[bold]Type[/]");
+        table.AddColumn("[bold]Size[/]");
+        
+        foreach (var entry in entries.Take(20)) // Show first 20
+        {
+            var sizeText = entry.EntryType == FileSystemEntryType.File 
+                ? FormatFileSize(entry.Size) 
+                : "[dim]Directory[/]";
+                
+            table.AddRow(
+                $"[dim]{entry.Path}[/]",
+                $"[cyan]{entry.EntryType}[/]",
+                sizeText
+            );
+        }
+        
+        if (entries.Count > 20)
+        {
+            table.AddRow($"[dim]... and {entries.Count - 20} more entries[/]", "", "");
+        }
+        
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader($" [bold blue]FILE SYSTEM SCAN RESULTS ({entries.Count} entries)[/] ")
+        };
+        
+        AnsiConsole.Write(panel);
+    }
+    
     /// <summary>
     /// Executes the main cleaning operation.
     /// </summary>
@@ -102,31 +470,40 @@ internal static class Program
 
         try
         {
-            WriteInfo("Starting Autodesk cleanup operation...");
-            Console.WriteLine();
+            AnsiConsole.Write(new Rule("[bold yellow]AUTODESK CLEANUP OPERATION[/]"));
+            
+            if (config.DryRun)
+            {
+                AnsiConsole.MarkupLine("[bold yellow]DRY RUN MODE - No actual changes will be made[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[bold red]LIVE MODE - Changes will be permanent[/]");
+            }
 
             // Phase 1: Registry Cleanup
-            WriteStep("Phase 1: Registry Cleanup");
-            using var registryScanner = new AutodeskRegistryScanner(config);
+            AnsiConsole.Write(new Rule("[bold blue]Phase 1: Registry Cleanup[/]"));
             
-            WriteInfo("Scanning registry for Autodesk entries...");
-            var registryEntries = await registryScanner.ScanRegistryAsync();
-            WriteSuccess($"Found {registryEntries.Count} registry entries to clean.");
+            var registryEntries = await AnsiConsole.Status()
+                .StartAsync("[green]Scanning registry for Autodesk entries...[/]", async ctx =>
+                {
+                    using var registryScanner = new AutodeskRegistryScanner(config);
+                    return await registryScanner.ScanRegistryAsync();
+                });
+                
+            AnsiConsole.MarkupLine($"[green]Found {registryEntries.Count} registry entries to clean.[/]");
 
             if (registryEntries.Count > 0)
             {
-                WriteInfo("Registry entries to be removed:");
-                foreach (var entry in registryEntries.Take(10)) // Show first 10
-                {
-                    WriteDetail($"  • {entry.DisplayName}");
-                }
+                DisplayRegistryResults(registryEntries);
                 
-                if (registryEntries.Count > 10)
-                {
-                    WriteDetail($"  ... and {registryEntries.Count - 10} more entries");
-                }
-
-                var registryResult = await registryScanner.RemoveEntriesAsync(registryEntries);
+                var registryResult = await AnsiConsole.Status()
+                    .StartAsync("[yellow]Processing registry entries...[/]", async ctx =>
+                    {
+                        using var registryScanner = new AutodeskRegistryScanner(config);
+                        return await registryScanner.RemoveEntriesAsync(registryEntries);
+                    });
+                    
                 DisplayRemovalResult("Registry", registryResult);
                 
                 if (!registryResult.IsSuccessful)
@@ -137,36 +514,32 @@ internal static class Program
             }
             else
             {
-                WriteInfo("No registry entries found to clean.");
+                AnsiConsole.MarkupLine("[dim]No registry entries found to clean.[/]");
             }
 
-            Console.WriteLine();
-
             // Phase 2: File System Cleanup
-            WriteStep("Phase 2: File System Cleanup");
-            using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
+            AnsiConsole.Write(new Rule("[bold blue]Phase 2: File System Cleanup[/]"));
             
-            WriteInfo("Scanning file system for Autodesk files and directories...");
-            var fileSystemEntries = await fileSystemCleaner.ScanFileSystemAsync();
-            WriteSuccess($"Found {fileSystemEntries.Count} file system entries to clean.");
+            var fileSystemEntries = await AnsiConsole.Status()
+                .StartAsync("[green]Scanning file system for Autodesk files and directories...[/]", async ctx =>
+                {
+                    using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
+                    return await fileSystemCleaner.ScanFileSystemAsync();
+                });
+                
+            AnsiConsole.MarkupLine($"[green]Found {fileSystemEntries.Count} file system entries to clean.[/]");
 
             if (fileSystemEntries.Count > 0)
             {
-                WriteInfo("File system entries to be removed:");
-                foreach (var entry in fileSystemEntries.Take(10)) // Show first 10
-                {
-                    var sizeText = entry.EntryType == FileSystemEntryType.File 
-                        ? $" ({FormatFileSize(entry.Size)})" 
-                        : " (Directory)";
-                    WriteDetail($"  • {entry.Path}{sizeText}");
-                }
+                DisplayFileSystemResults(fileSystemEntries);
                 
-                if (fileSystemEntries.Count > 10)
-                {
-                    WriteDetail($"  ... and {fileSystemEntries.Count - 10} more entries");
-                }
-
-                var fileSystemResult = await fileSystemCleaner.RemoveEntriesAsync(fileSystemEntries);
+                var fileSystemResult = await AnsiConsole.Status()
+                    .StartAsync("[yellow]Processing file system entries...[/]", async ctx =>
+                    {
+                        using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
+                        return await fileSystemCleaner.RemoveEntriesAsync(fileSystemEntries);
+                    });
+                    
                 DisplayRemovalResult("File System", fileSystemResult);
                 
                 if (!fileSystemResult.IsSuccessful)
@@ -177,10 +550,8 @@ internal static class Program
             }
             else
             {
-                WriteInfo("No file system entries found to clean.");
+                AnsiConsole.MarkupLine("[dim]No file system entries found to clean.[/]");
             }
-
-            Console.WriteLine();
 
             // Summary
             WriteSummary(overallSuccess, totalErrors, config.DryRun);
@@ -189,7 +560,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            WriteError($"Operation failed: {ex.Message}");
+            AnsiConsole.WriteException(ex);
             return -1;
         }
     }
@@ -201,33 +572,43 @@ internal static class Program
     /// <param name="result">The removal result.</param>
     private static void DisplayRemovalResult(string phaseName, RemovalResult result)
     {
-        if (result.IsSuccessful)
+        var table = new Table()
         {
-            WriteSuccess($"{phaseName} cleanup completed successfully!");
-        }
-        else
+            Border = TableBorder.Rounded,
+            BorderStyle = result.IsSuccessful ? new Style(Color.Green) : new Style(Color.Yellow)
+        };
+        
+        table.AddColumn("[bold]Metric[/]");
+        table.AddColumn("[bold]Value[/]");
+        
+        table.AddRow("Total Entries", result.TotalEntries.ToString());
+        table.AddRow("Successfully Removed", $"[green]{result.SuccessfulRemovals}[/]");
+        table.AddRow("Failed Removals", result.FailedRemovals > 0 ? $"[red]{result.FailedRemovals}[/]" : "0");
+        table.AddRow("Success Rate", $"{result.SuccessRate:F1}%");
+        table.AddRow("Duration", $"{result.Duration.TotalSeconds:F2} seconds");
+        
+        var statusIcon = result.IsSuccessful ? "OK" : "WARNING";
+        var statusColor = result.IsSuccessful ? "green" : "yellow";
+        
+        var panel = new Panel(table)
         {
-            WriteWarning($"{phaseName} cleanup completed with some errors.");
-        }
-
-        WriteDetail($"  • Total entries: {result.TotalEntries}");
-        WriteDetail($"  • Successfully removed: {result.SuccessfulRemovals}");
-        WriteDetail($"  • Failed removals: {result.FailedRemovals}");
-        WriteDetail($"  • Success rate: {result.SuccessRate:F1}%");
-        WriteDetail($"  • Duration: {result.Duration.TotalSeconds:F2} seconds");
-
+            Header = new PanelHeader($" [bold {statusColor}]{statusIcon} {phaseName} Cleanup Results[/] ")
+        };
+        
+        AnsiConsole.Write(panel);
+        
         if (result.Errors.Count > 0)
         {
-            WriteWarning($"  • Errors encountered: {result.Errors.Count}");
-            foreach (var error in result.Errors.Take(5)) // Show first 5 errors
+            var errorPanel = new Panel(
+                string.Join("\n", result.Errors.Take(5).Select(error => $"[red]• {error}[/]")) +
+                (result.Errors.Count > 5 ? $"\n[dim]... and {result.Errors.Count - 5} more errors[/]" : ""))
             {
-                WriteError($"    - {error}");
-            }
+                Header = new PanelHeader($" [bold red]Errors Encountered ({result.Errors.Count})[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Red)
+            };
             
-            if (result.Errors.Count > 5)
-            {
-                WriteDetail($"    ... and {result.Errors.Count - 5} more errors");
-            }
+            AnsiConsole.Write(errorPanel);
         }
     }
 
@@ -239,95 +620,70 @@ internal static class Program
     /// <param name="isDryRun">Whether this was a dry run.</param>
     private static void WriteSummary(bool overallSuccess, List<string> totalErrors, bool isDryRun)
     {
-        WriteStep("Operation Summary");
+        AnsiConsole.Write(new Rule("[bold blue]OPERATION SUMMARY[/]"));
+        
+        Panel summaryPanel;
         
         if (isDryRun)
         {
-            WriteInfo("DRY RUN COMPLETED - No actual changes were made to your system.");
+            summaryPanel = new Panel(new Markup(
+                "[bold blue]DRY RUN COMPLETED[/]\n\n" +
+                "No actual changes were made to your system.\n" +
+                "This was a preview of what would be removed in a real cleanup operation."))
+            {
+                Header = new PanelHeader(" [bold blue]DRY RUN SUMMARY[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Blue)
+            };
         }
         else if (overallSuccess)
         {
-            WriteSuccess("Autodesk cleanup completed successfully!");
-            WriteInfo("All Autodesk registry entries and files have been removed from your system.");
-            WriteInfo("You can now proceed with a fresh installation of Autodesk products.");
+            summaryPanel = new Panel(new Markup(
+                "[bold green]Autodesk cleanup completed successfully![/]\n\n" +
+                "All Autodesk registry entries and files have been removed from your system.\n" +
+                "You can now proceed with a fresh installation of Autodesk products."))
+            {
+                Header = new PanelHeader(" [bold green]SUCCESS[/] "),
+                Border = BoxBorder.Double,
+                BorderStyle = new Style(Color.Green)
+            };
         }
         else
         {
-            WriteWarning("Autodesk cleanup completed with some errors.");
-            WriteInfo($"Total errors encountered: {totalErrors.Count}");
-            WriteInfo("Some Autodesk entries may still remain on your system.");
-            WriteInfo("You may need to manually remove remaining entries or run the tool again.");
+            summaryPanel = new Panel(new Markup(
+                $"[bold yellow]Autodesk cleanup completed with some errors.[/]\n\n" +
+                $"Total errors encountered: [red]{totalErrors.Count}[/]\n" +
+                "Some Autodesk entries may still remain on your system.\n" +
+                "You may need to manually remove remaining entries or run the tool again."))
+            {
+                Header = new PanelHeader(" [bold yellow]PARTIAL SUCCESS[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Yellow)
+            };
         }
-
-        Console.WriteLine();
-        WriteInfo("IMPORTANT NOTES:");
-        WriteDetail("• Restart your computer before installing new Autodesk products");
-        WriteDetail("• Clear your browser cache if using web-based installers");
-        WriteDetail("• Temporarily disable antivirus during Autodesk installation");
-        WriteDetail("• Run Windows Update before installing new Autodesk products");
-    }
-
-    /// <summary>
-    /// Parses command line arguments into a ScannerConfig.
-    /// </summary>
-    /// <param name="args">Command line arguments.</param>
-    /// <returns>Parsed configuration.</returns>
-    private static ScannerConfig ParseArguments(string[] args)
-    {
-        var dryRun = args.Contains("--dry-run") || args.Contains("-d");
-        var noBackup = args.Contains("--no-backup") || args.Contains("-n");
-        var userOnly = args.Contains("--user-only") || args.Contains("-u");
-        var systemOnly = args.Contains("--system-only") || args.Contains("-s");
-
-        var backupPath = ScannerConfig.Default.BackupPath;
-        var backupIndex = Array.IndexOf(args, "--backup-path");
-        if (backupIndex >= 0 && backupIndex + 1 < args.Length)
-        {
-            backupPath = args[backupIndex + 1];
-        }
-
-        return new ScannerConfig(
-            CreateBackup: !noBackup,
-            BackupPath: backupPath,
-            DryRun: dryRun,
-            IncludeUserHive: !systemOnly,
-            IncludeLocalMachine: !userOnly,
-            MaxDepth: 10);
-    }
-
-    /// <summary>
-    /// Displays the current configuration.
-    /// </summary>
-    /// <param name="config">The configuration to display.</param>
-    private static void DisplayConfiguration(ScannerConfig config)
-    {
-        WriteStep("Configuration");
-        WriteDetail($"Dry Run: {(config.DryRun ? "Yes" : "No")}");
-        WriteDetail($"Create Backup: {(config.CreateBackup ? "Yes" : "No")}");
-        if (config.CreateBackup)
-        {
-            WriteDetail($"Backup Path: {config.BackupPath}");
-        }
-        WriteDetail($"Include User Registry: {(config.IncludeUserHive ? "Yes" : "No")}");
-        WriteDetail($"Include System Registry: {(config.IncludeLocalMachine ? "Yes" : "No")}");
-        WriteDetail($"Max Scan Depth: {config.MaxDepth}");
-        Console.WriteLine();
-    }
-
-    /// <summary>
-    /// Gets user confirmation before proceeding with the operation.
-    /// </summary>
-    /// <returns>True if the user confirmed, false otherwise.</returns>
-    private static bool GetUserConfirmation()
-    {
-        WriteWarning("WARNING: This operation will permanently remove ALL Autodesk products and data from your system!");
-        WriteWarning("Make sure you have backed up any important project files before proceeding.");
-        Console.WriteLine();
         
-        WriteInfo("Do you want to proceed with the cleanup? (y/N): ");
-        var response = Console.ReadLine()?.Trim().ToLowerInvariant();
-        return response == "y" || response == "yes";
+        AnsiConsole.Write(summaryPanel);
+        
+        // Important notes
+        var notesList = new List<string>
+        {
+            "Restart your computer before installing new Autodesk products",
+            "Clear your browser cache if using web-based installers",
+            "Temporarily disable antivirus during Autodesk installation",
+            "Run Windows Update before installing new Autodesk products"
+        };
+        
+        var notesPanel = new Panel(
+            string.Join("\n", notesList.Select(note => $"[yellow]•[/] {note}")))
+        {
+            Header = new PanelHeader(" [bold cyan]IMPORTANT NOTES[/] "),
+            Border = BoxBorder.Rounded,
+            BorderStyle = new Style(Color.Blue)
+        };
+        
+        AnsiConsole.Write(notesPanel);
     }
+
 
     /// <summary>
     /// Checks if the application is running with administrator privileges.
@@ -345,103 +701,6 @@ internal static class Program
         {
             return false;
         }
-    }
-
-    /// <summary>
-    /// Displays the application header.
-    /// </summary>
-    private static void WriteHeader()
-    {
-        Console.Clear();
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║                        AUTODESK REGISTRY CLEANER v1.0.0                    ║");
-        Console.WriteLine("║                     Modular Tool for Complete Autodesk Removal              ║");
-        Console.WriteLine("╚══════════════════════════════════════════════════════════════════════════════╝");
-        Console.ForegroundColor = OriginalForegroundColor;
-        Console.WriteLine();
-        
-        WriteInfo("This tool will completely remove all Autodesk products from your system including:");
-        WriteDetail("• Registry entries (HKLM and HKCU)");
-        WriteDetail("• Program files and directories");
-        WriteDetail("• User profile data");
-        WriteDetail("• Temporary files");
-        WriteDetail("• License files");
-        Console.WriteLine();
-        
-        WriteInfo("Command line options:");
-        WriteDetail("  --dry-run, -d       : Preview changes without making them");
-        WriteDetail("  --no-backup, -n     : Skip creating backups");
-        WriteDetail("  --user-only, -u     : Clean only user registry and files");
-        WriteDetail("  --system-only, -s   : Clean only system registry and files");
-        WriteDetail("  --backup-path PATH  : Specify custom backup location");
-        Console.WriteLine();
-    }
-
-    /// <summary>
-    /// Writes a step header to the console.
-    /// </summary>
-    /// <param name="message">The step message.</param>
-    private static void WriteStep(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"=== {message} ===");
-        Console.ForegroundColor = OriginalForegroundColor;
-    }
-
-    /// <summary>
-    /// Writes an informational message to the console.
-    /// </summary>
-    /// <param name="message">The message to write.</param>
-    private static void WriteInfo(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.White;
-        Console.Write(message);
-        Console.ForegroundColor = OriginalForegroundColor;
-    }
-
-    /// <summary>
-    /// Writes a success message to the console.
-    /// </summary>
-    /// <param name="message">The message to write.</param>
-    private static void WriteSuccess(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"✓ {message}");
-        Console.ForegroundColor = OriginalForegroundColor;
-    }
-
-    /// <summary>
-    /// Writes a warning message to the console.
-    /// </summary>
-    /// <param name="message">The message to write.</param>
-    private static void WriteWarning(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"⚠ {message}");
-        Console.ForegroundColor = OriginalForegroundColor;
-    }
-
-    /// <summary>
-    /// Writes an error message to the console.
-    /// </summary>
-    /// <param name="message">The message to write.</param>
-    private static void WriteError(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"✗ {message}");
-        Console.ForegroundColor = OriginalForegroundColor;
-    }
-
-    /// <summary>
-    /// Writes a detail message to the console.
-    /// </summary>
-    /// <param name="message">The message to write.</param>
-    private static void WriteDetail(string message)
-    {
-        Console.ForegroundColor = ConsoleColor.Gray;
-        Console.WriteLine(message);
-        Console.ForegroundColor = OriginalForegroundColor;
     }
 
     /// <summary>

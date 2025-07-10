@@ -2,6 +2,8 @@ using Microsoft.Win32;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using NLog;
+using System.IO.Abstractions;
+using Spectre.Console;
 
 namespace Autodesk_Cleaner.Core;
 
@@ -126,7 +128,7 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
                 if (_config.DryRun)
                 {
                     Logger.Debug("[DRY RUN] Would remove registry entry: {EntryPath}", entry.DisplayName);
-                    Console.WriteLine($"[DRY RUN] Would remove: {entry.DisplayName}");
+                    AnsiConsole.MarkupLine($"[dim][DRY RUN] Would remove: {entry.DisplayName}[/]");
                     successfulRemovals++;
                     continue;
                 }

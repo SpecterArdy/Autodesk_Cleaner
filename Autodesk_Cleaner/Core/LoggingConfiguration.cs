@@ -52,6 +52,7 @@ public static class LoggingConfiguration
     private static NLog.Config.LoggingConfiguration CreateNLogConfigurationFromToml(TomlTable model)
     {
         var config = new NLog.Config.LoggingConfiguration();
+        var ruleTables = new List<TomlTable>();
 
         // Process variables
         if (model.TryGetValue("NLog", out var nlogSection) && nlogSection is TomlTable nlogTable)
@@ -67,7 +68,7 @@ public static class LoggingConfiguration
                 }
             }
 
-            // Process targets
+            // Process targets first
             if (nlogTable.TryGetValue("targets", out var targetsSection) && targetsSection is TomlTableArray targetsArray)
             {
                 foreach (var targetItem in targetsArray)
@@ -83,20 +84,26 @@ public static class LoggingConfiguration
                 }
             }
 
-            // Process rules
+            // Collect rule tables for processing after targets are added
             if (nlogTable.TryGetValue("rules", out var rulesSection) && rulesSection is TomlTableArray rulesArray)
             {
                 foreach (var ruleItem in rulesArray)
                 {
                     if (ruleItem is TomlTable ruleTable)
                     {
-                        var rule = CreateRuleFromToml(ruleTable);
-                        if (rule != null)
-                        {
-                            config.LoggingRules.Add(rule);
-                        }
+                        ruleTables.Add(ruleTable);
                     }
                 }
+            }
+        }
+
+        // Now process rules after all targets have been added
+        foreach (var ruleTable in ruleTables)
+        {
+            var rule = CreateRuleFromToml(ruleTable, config);
+            if (rule != null)
+            {
+                config.LoggingRules.Add(rule);
             }
         }
 
@@ -152,8 +159,9 @@ public static class LoggingConfiguration
     /// Creates a logging rule from TOML configuration.
     /// </summary>
     /// <param name="ruleTable">The rule configuration table.</param>
+    /// <param name="config">The configuration object with targets already added.</param>
     /// <returns>The configured logging rule.</returns>
-    private static LoggingRule? CreateRuleFromToml(TomlTable ruleTable)
+    private static LoggingRule? CreateRuleFromToml(TomlTable ruleTable, NLog.Config.LoggingConfiguration config)
     {
         if (!ruleTable.TryGetValue("logger", out var loggerValue) || loggerValue is not string loggerName ||
             !ruleTable.TryGetValue("writeTo", out var writeToValue) || writeToValue is not string writeTo)
@@ -180,9 +188,14 @@ public static class LoggingConfiguration
             rule.SetLoggingLevels(minLevel, LogLevel.Fatal);
         }
 
-        // Add target (find target by name and add reference)
-        rule.Targets.Add(LogManager.Configuration?.FindTargetByName(writeTo) ?? throw new InvalidOperationException($"Target '{writeTo}' not found"));
-
+        // Add target (find target by name from the current config)
+        var target = config.FindTargetByName(writeTo);
+        if (target == null)
+        {
+            throw new InvalidOperationException($"Target '{writeTo}' not found in configuration");
+        }
+        
+        rule.Targets.Add(target);
         return rule;
     }
 
