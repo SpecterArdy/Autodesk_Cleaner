@@ -22,7 +22,7 @@ Autodesk Cleaner is a command-line utility for cleaning up redundant Autodesk-re
 
 Clone the repository:
 ```shell
- git clone (https://github.com/YourUsername/Autodesk_Cleaner.git](https://github.com/SpecterArdy/Autodesk_Cleaner.git)
+ git clone (https://github.com/SpecterArdy/Autodesk_Cleaner.git)
 ```
 Navigate into the directory:
 ```shell
