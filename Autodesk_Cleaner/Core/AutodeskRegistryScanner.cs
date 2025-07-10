@@ -132,6 +132,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             }
         }
 
+        // Stop Autodesk services before registry modifications
+        await StopAutodeskServicesAsync();
+
         // Process each valid entry
         if (!validEntries.Any())
         {
@@ -171,6 +174,7 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             }
             catch (Exception ex)
             {
+                Logger.Error(ex, "Error removing registry entry {EntryPath}: {Message}", entry.DisplayName, ex.Message);
                 errors.Add($"Error removing {entry.DisplayName}: {ex.Message}");
             }
         }
@@ -193,7 +197,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             var directory = Path.GetDirectoryName(backupPath);
             if (!string.IsNullOrEmpty(directory))
             {
+                Logger.Debug("Creating backup directory: {Directory}", directory);
                 Directory.CreateDirectory(directory);
+                Logger.Debug("Backup directory created successfully: {Directory}", directory);
             }
 
             // Use reg.exe to export registry
@@ -514,9 +520,65 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
         }
         catch (Exception ex)
         {
+            Logger.Error(ex, "Exception removing registry entry {EntryPath}", entry.DisplayName);
             _errors.Add($"Error removing registry entry {entry.DisplayName}: {ex.Message}");
             return Task.FromResult(false);
         }
+    }
+
+    /// <summary>
+    /// Stops Autodesk services that might interfere with registry operations.
+    /// </summary>
+    private async Task StopAutodeskServicesAsync()
+    {
+        var autodeskServices = new[] {
+            "AdskLicensingService",
+            "Autodesk Desktop App Service",
+            "AdAppMgrSvc",
+            "Mi-Service",
+            "AdskAccessServiceHost"
+        };
+
+        Logger.Info("Stopping Autodesk services that might interfere with registry operations...");
+        
+        foreach (var serviceName in autodeskServices)
+        {
+            try
+            {
+                Logger.Debug("Attempting to stop service: {ServiceName}", serviceName);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "sc.exe",
+                    Arguments = $"stop \"{serviceName}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                using var process = Process.Start(startInfo);
+                if (process != null)
+                {
+                    await process.WaitForExitAsync();
+                    if (process.ExitCode == 0)
+                    {
+                        Logger.Info("Successfully stopped service: {ServiceName}", serviceName);
+                    }
+                    else
+                    {
+                        Logger.Debug("Service {ServiceName} was not running or could not be stopped", serviceName);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug(ex, "Could not stop service {ServiceName}: {Message}", serviceName, ex.Message);
+            }
+        }
+        
+        // Wait a moment for services to fully stop
+        await Task.Delay(2000);
+        Logger.Info("Finished stopping Autodesk services");
     }
 
     /// <summary>
