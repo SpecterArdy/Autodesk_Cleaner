@@ -113,7 +113,8 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             Logger.Info("Completed FLEXnet scan, found {NewEntryCount} additional entries", _foundEntries.Count - initialCount);
 
             Logger.Info("File system scan completed. Total entries found: {TotalEntries}, Errors: {ErrorCount}", _foundEntries.Count, _errors.Count);
-            return _foundEntries.AsReadOnly();
+            // Return a copy to avoid issues with disposal clearing the internal list
+            return _foundEntries.ToList().AsReadOnly();
         }
         catch (Exception ex)
         {
