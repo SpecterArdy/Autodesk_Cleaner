@@ -559,12 +559,12 @@ internal static class Program
             {
                 DisplayFileSystemResults(fileSystemEntries);
                 
-                var fileSystemResult = await AnsiConsole.Status()
-                    .StartAsync("[yellow]Processing file system entries...[/]", async ctx =>
-                    {
-                        using var fileSystemCleaner = new AutodeskFileSystemCleaner(config);
-                        return await fileSystemCleaner.RemoveEntriesAsync(fileSystemEntries);
-                    });
+                AnsiConsole.MarkupLine("[yellow]Processing file system entries...[/]");
+                RemovalResult fileSystemResult;
+                using (var fileSystemCleaner = new AutodeskFileSystemCleaner(config))
+                {
+                    fileSystemResult = await fileSystemCleaner.RemoveEntriesAsync(fileSystemEntries);
+                }
                     
                 DisplayRemovalResult("File System", fileSystemResult);
                 

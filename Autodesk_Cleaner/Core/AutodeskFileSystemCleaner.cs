@@ -193,6 +193,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         // Stop Autodesk services before deletion
         await StopAutodeskServicesAsync();
         
+        // Kill any remaining Autodesk processes
+        await KillAllAutodeskProcessesAsync();
+        
         // Process each valid entry
         if (!validEntries.Any())
         {
@@ -206,14 +209,43 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             );
         }
 
+        // Progress reporting setup
+        var processedCount = 0;
+        var totalCount = validEntries.Count;
+        var progressReportInterval = Math.Max(1, totalCount / 100); // Report every 1% or at least every entry
+        
+        Logger.Info("Starting removal of {TotalCount} file system entries", totalCount);
+        
         foreach (var entry in validEntries)
         {
             try
             {
+                processedCount++;
+                
+                // Progress reporting
+                if (processedCount % progressReportInterval == 0 || processedCount == totalCount)
+                {
+                    var progressPercentage = (double)processedCount / totalCount * 100;
+                    Logger.Info("Processing file system entries: {ProcessedCount}/{TotalCount} ({ProgressPercentage:F1}%)", 
+                        processedCount, totalCount, progressPercentage);
+                    
+                    if (!_config.DryRun)
+                    {
+                        // Simple console output for visible progress
+                        AnsiConsole.WriteLine($"Progress: {processedCount}/{totalCount} ({progressPercentage:F1}%) - {entry.DisplayName}");
+                    }
+                }
+                
                 if (_config.DryRun)
                 {
                     AnsiConsole.MarkupLine($"[dim][DRY RUN] Would remove: {entry.Path}[/]");
                     successfulRemovals++;
+                    
+                    // Yield control periodically during dry run
+                    if (processedCount % 100 == 0)
+                    {
+                        await Task.Delay(1); // Yield control to prevent UI freezing
+                    }
                     continue;
                 }
 
@@ -228,6 +260,12 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                     Logger.Warn("Failed to remove file system entry: {Path}", entry.Path);
                     errors.Add($"Failed to remove: {entry.Path}");
                 }
+                
+                // Yield control periodically to prevent UI freezing
+                if (processedCount % 10 == 0)
+                {
+                    await Task.Delay(1); // Small delay to allow UI updates
+                }
             }
             catch (Exception ex)
             {
@@ -235,6 +273,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                 errors.Add($"Error removing {entry.Path}: {ex.Message}");
             }
         }
+        
+        Logger.Info("Completed processing {TotalCount} file system entries. Successful: {SuccessfulCount}, Failed: {FailedCount}", 
+            totalCount, successfulRemovals, totalCount - successfulRemovals);
 
         stopwatch.Stop();
 
@@ -618,35 +659,32 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             "AdskAccessServiceHost"
         };
 
-        Logger.Info("Stopping Autodesk services that might lock files...");
+            Logger.Info("Stopping Autodesk services that might lock files...");
         
         foreach (var serviceName in autodeskServices)
         {
             try
             {
                 Logger.Debug("Attempting to stop service: {ServiceName}", serviceName);
-                var startInfo = new ProcessStartInfo
+                
+                // First try to stop the service normally
+                var stopResult = await StopServiceAsync(serviceName);
+                if (stopResult)
                 {
-                    FileName = "sc.exe",
-                    Arguments = $"stop \"{serviceName}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-
-                using var process = Process.Start(startInfo);
-                if (process != null)
+                    Logger.Info("Successfully stopped service: {ServiceName}", serviceName);
+                    continue;
+                }
+                
+                // If normal stop failed, try to force stop
+                Logger.Debug("Normal stop failed, attempting to force stop service: {ServiceName}", serviceName);
+                var forceStopResult = await ForceStopServiceAsync(serviceName);
+                if (forceStopResult)
                 {
-                    await process.WaitForExitAsync();
-                    if (process.ExitCode == 0)
-                    {
-                        Logger.Info("Successfully stopped service: {ServiceName}", serviceName);
-                    }
-                    else
-                    {
-                        Logger.Debug("Service {ServiceName} was not running or could not be stopped", serviceName);
-                    }
+                    Logger.Info("Successfully force-stopped service: {ServiceName}", serviceName);
+                }
+                else
+                {
+                    Logger.Debug("Service {ServiceName} was not running or could not be stopped", serviceName);
                 }
             }
             catch (Exception ex)
@@ -658,6 +696,265 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         // Wait a moment for services to fully stop
         await Task.Delay(2000);
         Logger.Info("Finished stopping Autodesk services");
+    }
+    
+    /// <summary>
+    /// Kills all Autodesk-related processes that might be locking files.
+    /// </summary>
+    private async Task KillAllAutodeskProcessesAsync()
+    {
+        Logger.Info("Killing all Autodesk-related processes that might lock files...");
+        
+        var autodeskProcessNames = new[] 
+        {
+            "adskflex", "lmgrd", "lmadmin", "AutodeskDesktopApp", "AdskLicensingAgent",
+            "AdskLicensingService", "AdskAccessCore", "AdskAccessService", "AdAppMgrSvc",
+            "maya", "3dsmax", "autocad", "revit", "inventor", "fusion360", "navisworks",
+            "mudbox", "motionbuilder", "alias", "adsk", "autodesk"
+        };
+        
+        var killedProcesses = 0;
+        
+        foreach (var processName in autodeskProcessNames)
+        {
+            try
+            {
+                var processes = Process.GetProcessesByName(processName);
+                foreach (var process in processes)
+                {
+                    try
+                    {
+                        if (ProtectedProcesses.Contains(process.ProcessName))
+                        {
+                            Logger.Debug("Skipping protected system process: {ProcessName} (PID: {ProcessId})", 
+                                process.ProcessName, process.Id);
+                            continue;
+                        }
+                        
+                        Logger.Info("Killing Autodesk process: {ProcessName} (PID: {ProcessId})", 
+                            process.ProcessName, process.Id);
+                        
+                        if (!process.HasExited)
+                        {
+                            process.Kill();
+                            await process.WaitForExitAsync();
+                            killedProcesses++;
+                            
+                            Logger.Info("Successfully killed process: {ProcessName} (PID: {ProcessId})", 
+                                process.ProcessName, process.Id);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug(ex, "Could not kill process {ProcessName} (PID: {ProcessId}): {Message}", 
+                            process.ProcessName, process.Id, ex.Message);
+                    }
+                    finally
+                    {
+                        process.Dispose();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug(ex, "Error searching for processes with name {ProcessName}: {Message}", processName, ex.Message);
+            }
+        }
+        
+        if (killedProcesses > 0)
+        {
+            Logger.Info("Killed {KilledCount} Autodesk processes", killedProcesses);
+            // Wait for processes to fully terminate and release file handles
+            await Task.Delay(3000);
+        }
+        else
+        {
+            Logger.Debug("No Autodesk processes found to kill");
+        }
+        
+        Logger.Info("Finished killing Autodesk processes");
+    }
+    
+    /// <summary>
+    /// Attempts to stop a Windows service normally.
+    /// </summary>
+    /// <param name="serviceName">The name of the service to stop.</param>
+    /// <returns>True if the service was stopped successfully, false otherwise.</returns>
+    private async Task<bool> StopServiceAsync(string serviceName)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"stop \"{serviceName}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process != null)
+            {
+                await process.WaitForExitAsync();
+                if (process.ExitCode == 0)
+                {
+                    // Wait a bit for the service to actually stop
+                    await Task.Delay(1000);
+                    return await IsServiceStoppedAsync(serviceName);
+                }
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Error stopping service {ServiceName}: {Message}", serviceName, ex.Message);
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Force stops a Windows service by killing its process.
+    /// </summary>
+    /// <param name="serviceName">The name of the service to force stop.</param>
+    /// <returns>True if the service was force-stopped successfully, false otherwise.</returns>
+    private async Task<bool> ForceStopServiceAsync(string serviceName)
+    {
+        try
+        {
+            // First, try to get the service process ID
+            var serviceProcessId = await GetServiceProcessIdAsync(serviceName);
+            if (serviceProcessId > 0)
+            {
+                try
+                {
+                    var serviceProcess = Process.GetProcessById(serviceProcessId);
+                    if (!serviceProcess.HasExited)
+                    {
+                        Logger.Debug("Force killing service process {ServiceName} (PID: {ProcessId})", serviceName, serviceProcessId);
+                        serviceProcess.Kill();
+                        await serviceProcess.WaitForExitAsync();
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug(ex, "Error force killing service process {ServiceName}: {Message}", serviceName, ex.Message);
+                }
+            }
+            
+            // If we can't get the process ID, try taskkill
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "taskkill.exe",
+                Arguments = $"/F /IM {serviceName}.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process != null)
+            {
+                await process.WaitForExitAsync();
+                return process.ExitCode == 0;
+            }
+            
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Error force stopping service {ServiceName}: {Message}", serviceName, ex.Message);
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Checks if a Windows service is stopped.
+    /// </summary>
+    /// <param name="serviceName">The name of the service to check.</param>
+    /// <returns>True if the service is stopped, false otherwise.</returns>
+    private async Task<bool> IsServiceStoppedAsync(string serviceName)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"query \"{serviceName}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process != null)
+            {
+                await process.WaitForExitAsync();
+                var output = await process.StandardOutput.ReadToEndAsync();
+                
+                // Check if the service state indicates it's stopped
+                return output.Contains("STOPPED", StringComparison.OrdinalIgnoreCase) ||
+                       output.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Error checking service status {ServiceName}: {Message}", serviceName, ex.Message);
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Gets the process ID of a Windows service.
+    /// </summary>
+    /// <param name="serviceName">The name of the service.</param>
+    /// <returns>The process ID of the service, or 0 if not found.</returns>
+    private async Task<int> GetServiceProcessIdAsync(string serviceName)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "tasklist.exe",
+                Arguments = $"/SVC /FI \"SERVICES eq {serviceName}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process != null)
+            {
+                await process.WaitForExitAsync();
+                var output = await process.StandardOutput.ReadToEndAsync();
+                
+                // Parse the output to extract the PID
+                var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var line in lines)
+                {
+                    if (line.Contains(serviceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length >= 2 && int.TryParse(parts[1], out var pid))
+                        {
+                            return pid;
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Error getting service process ID {ServiceName}: {Message}", serviceName, ex.Message);
+            return 0;
+        }
     }
 
     /// <summary>
@@ -695,8 +992,11 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                     Logger.Info("Killing process {ProcessName} (PID: {ProcessId}) that is using file: {FilePath}", 
                         process.ProcessName, process.Id, filePath);
                     
-                    process.Kill();
-                    await process.WaitForExitAsync();
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                        await process.WaitForExitAsync();
+                    }
                     killedProcesses++;
                     
                     Logger.Info("Successfully killed process {ProcessName} (PID: {ProcessId})", 
