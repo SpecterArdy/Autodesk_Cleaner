@@ -3,7 +3,9 @@ using System.IO.Compression;
 using System.IO.Abstractions;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Text.RegularExpressions;
+using Microsoft.Management.Infrastructure;
 using NLog;
 using Spectre.Console;
 namespace Autodesk_Cleaner.Core;
@@ -776,7 +778,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     }
     
     /// <summary>
-    /// Attempts to stop a Windows service normally.
+    /// Attempts to stop a Windows service normally using ServiceController.
     /// </summary>
     /// <param name="serviceName">The name of the service to stop.</param>
     /// <returns>True if the service was stopped successfully, false otherwise.</returns>
@@ -784,27 +786,40 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     {
         try
         {
-            var startInfo = new ProcessStartInfo
+            using var service = new ServiceController(serviceName);
+            
+            // Check if service exists and is running
+            if (service.Status == ServiceControllerStatus.Stopped || 
+                service.Status == ServiceControllerStatus.StopPending)
             {
-                FileName = "sc.exe",
-                Arguments = $"stop \"{serviceName}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using var process = Process.Start(startInfo);
-            if (process != null)
-            {
-                await process.WaitForExitAsync();
-                if (process.ExitCode == 0)
-                {
-                    // Wait a bit for the service to actually stop
-                    await Task.Delay(1000);
-                    return await IsServiceStoppedAsync(serviceName);
-                }
+                Logger.Debug("Service {ServiceName} is already stopped or stopping", serviceName);
+                return true;
             }
+            
+            if (service.Status != ServiceControllerStatus.Running)
+            {
+                Logger.Debug("Service {ServiceName} is in state {Status}, cannot stop", serviceName, service.Status);
+                return false;
+            }
+            
+            Logger.Debug("Stopping service {ServiceName} (current status: {Status})", serviceName, service.Status);
+            service.Stop();
+            
+            // Wait for the service to stop with timeout
+            var timeout = TimeSpan.FromSeconds(30);
+            await Task.Run(() => service.WaitForStatus(ServiceControllerStatus.Stopped, timeout));
+            
+            Logger.Info("Successfully stopped service: {ServiceName}", serviceName);
+            return true;
+        }
+        catch (InvalidOperationException ex)
+        {
+            Logger.Debug(ex, "Service {ServiceName} does not exist or cannot be accessed: {Message}", serviceName, ex.Message);
+            return false;
+        }
+        catch (System.ServiceProcess.TimeoutException ex)
+        {
+            Logger.Debug(ex, "Timeout stopping service {ServiceName}: {Message}", serviceName, ex.Message);
             return false;
         }
         catch (Exception ex)
@@ -1221,7 +1236,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
 
     /// <summary>
     /// Removes a specific file system entry.
-    /// </summary>
+    /// <summary>
     /// <param name="entry">The file system entry to remove.</param>
     /// <returns>True if removal was successful, false otherwise.</returns>
     private async Task<bool> RemoveFileSystemEntryAsync(FileSystemEntry entry)
@@ -1230,104 +1245,11 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         {
             if (entry.EntryType == FileSystemEntryType.File)
             {
-                if (File.Exists(entry.Path))
-                {
-                    // First attempt: try to delete normally
-                    try
-                    {
-                        // Remove read-only attribute if present
-                        if (entry.IsReadOnly)
-                        {
-                            File.SetAttributes(entry.Path, File.GetAttributes(entry.Path) & ~FileAttributes.ReadOnly);
-                        }
-
-                        File.Delete(entry.Path);
-                        return true;
-                    }
-                    catch (IOException ex) when (ex.Message.Contains("being used by another process") || 
-                                                ex.Message.Contains("access is denied"))
-                    {
-                        Logger.Debug("File {Path} is in use, attempting to kill processes using it", entry.Path);
-                        
-                        // Kill processes using the file
-                        await KillProcessesUsingFileAsync(entry.Path);
-                        
-                        // Try again after killing processes
-                        try
-                        {
-                            if (entry.IsReadOnly)
-                            {
-                                File.SetAttributes(entry.Path, File.GetAttributes(entry.Path) & ~FileAttributes.ReadOnly);
-                            }
-                            File.Delete(entry.Path);
-                            return true;
-                        }
-                        catch (Exception retryEx)
-                        {
-                            Logger.Debug(retryEx, "Failed to delete file {Path} even after killing processes: {Message}", 
-                                entry.Path, retryEx.Message);
-                            throw;
-                        }
-                    }
-                }
+                return await RemoveFileAsync(entry.Path, entry.IsReadOnly);
             }
             else if (entry.EntryType == FileSystemEntryType.Directory)
             {
-                if (Directory.Exists(entry.Path))
-                {
-                    // First attempt: try to delete normally
-                    try
-                    {
-                        // Remove read-only attributes from all files in the directory
-                        var directoryInfo = new DirectoryInfo(entry.Path);
-                        foreach (var file in directoryInfo.GetFiles("*", SearchOption.AllDirectories))
-                        {
-                            if (file.IsReadOnly)
-                            {
-                                file.Attributes &= ~FileAttributes.ReadOnly;
-                            }
-                        }
-
-                        Directory.Delete(entry.Path, true);
-                        return true;
-                    }
-                    catch (IOException ex) when (ex.Message.Contains("being used by another process") || 
-                                                ex.Message.Contains("access is denied"))
-                    {
-                        Logger.Debug("Directory {Path} contains files in use, attempting to kill processes", entry.Path);
-                        
-                        // Kill processes using files in the directory
-                        var directoryInfo = new DirectoryInfo(entry.Path);
-                        var filesInUse = directoryInfo.GetFiles("*", SearchOption.AllDirectories);
-                        
-                        foreach (var file in filesInUse)
-                        {
-                            await KillProcessesUsingFileAsync(file.FullName);
-                        }
-                        
-                        // Try again after killing processes
-                        try
-                        {
-                            // Remove read-only attributes again
-                            foreach (var file in directoryInfo.GetFiles("*", SearchOption.AllDirectories))
-                            {
-                                if (file.IsReadOnly)
-                                {
-                                    file.Attributes &= ~FileAttributes.ReadOnly;
-                                }
-                            }
-                            
-                            Directory.Delete(entry.Path, true);
-                            return true;
-                        }
-                        catch (Exception retryEx)
-                        {
-                            Logger.Debug(retryEx, "Failed to delete directory {Path} even after killing processes: {Message}", 
-                                entry.Path, retryEx.Message);
-                            throw;
-                        }
-                    }
-                }
+                return await RemoveDirectoryAsync(entry.Path);
             }
 
             return false;
@@ -1339,6 +1261,138 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             return false;
         }
     }
+
+    /// <summary>
+    /// Attempts to remove a file, retrying if necessary.
+    /// <summary>
+    private async Task<bool> RemoveFileAsync(string filePath, bool isReadOnly)
+    {
+        try
+        {
+            // Remove read-only attribute if present
+            if (isReadOnly && File.Exists(filePath))
+            {
+                File.SetAttributes(filePath, File.GetAttributes(filePath) & ~FileAttributes.ReadOnly);
+            }
+
+            File.Delete(filePath);
+            return true;
+        }
+        catch(IOException ex) when (ex.Message.Contains("being used by another process") || 
+                                    ex.Message.Contains("access is denied"))
+        {
+            Logger.Debug("File {Path} is in use, attempting to kill processes using it", filePath);
+
+            // Kill processes using the file
+            await KillProcessesUsingFileAsync(filePath);
+
+            // Try again after killing processes
+            try
+            {
+                if (isReadOnly && File.Exists(filePath))
+                {
+                    File.SetAttributes(filePath, File.GetAttributes(filePath) & ~FileAttributes.ReadOnly);
+                }
+                File.Delete(filePath);
+                return true;
+            }
+            catch
+            {
+                // Emergency fallback to WMI deletion
+                Logger.Debug("Attempting WMI file deletion for {Path}", filePath);
+                return await DeleteFileWmiAsync(filePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Error removing file {Path}: {Message}", filePath, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a file using WMI.
+    /// <summary>
+    private Task<bool> DeleteFileWmiAsync(string filePath)
+    {
+        return Task.Run(() => DeleteFileWmi(filePath));
+    }
+
+    /// <summary>
+    /// Deletes a file using WMI synchronously.
+    /// </summary>
+    private bool DeleteFileWmi(string filePath)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "root\\cimv2",
+                $"SELECT * FROM CIM_DataFile WHERE Name='{filePath.Replace("\\", "\\\\")}'")
+            {
+                Options = { Timeout = TimeSpan.FromSeconds(30) }
+            };
+
+            using var collection = searcher.Get();
+            foreach (ManagementObject file in collection)
+            {
+                using (file)
+                {
+                    var result = file.InvokeMethod("Delete", null);
+                    if (result != null && Convert.ToInt32(result) == 0)
+                    {
+                        Logger.Info("Successfully deleted file via WMI: {Path}", filePath);
+                        return true;
+                    }
+                    else
+                    {
+                        Logger.Warn("WMI file deletion failed for {Path} with return value: {ReturnValue}",
+                            filePath, result);
+                    }
+                }
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "WMI deletion error for file {Path}: {Message}", filePath, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Attempts to remove a directory, retrying if necessary, using forced deletion.
+    /// <summary>
+    private async Task<bool> RemoveDirectoryAsync(string directoryPath)
+    {
+        if (!Directory.Exists(directoryPath))
+        {
+            return true;
+        }
+
+        try
+        {
+            // Remove read-only attributes from all files in the directory
+            var directoryInfo = new DirectoryInfo(directoryPath);
+            foreach (var file in directoryInfo.GetFiles("*", SearchOption.AllDirectories))
+            {
+                if (file.IsReadOnly)
+                {
+                    file.Attributes &= ~FileAttributes.ReadOnly;
+                }
+            }
+
+            Directory.Delete(directoryPath, true);
+            return true;
+        }
+        catch (IOException)
+        {
+            Logger.Debug("Retrying directory deletion for {Path}", directoryPath);
+            
+            // If retry fails, try WMI approach
+            return await DeleteFileWmiAsync(directoryPath);
+        }
+    }
+    
 
     /// <summary>
     /// Disposes of the cleaner resources.
