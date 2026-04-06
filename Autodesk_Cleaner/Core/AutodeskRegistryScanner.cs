@@ -1,4 +1,6 @@
 using Microsoft.Win32;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using NLog;
@@ -26,7 +28,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
         @"SOFTWARE\WOW6432Node\Autodesk",
         @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        @"SOFTWARE\Classes\Installer\Products"
+        @"SOFTWARE\Classes\Installer\Products",
+        @"SOFTWARE\Classes\Installer\Features",
+        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products"
     ];
 
     /// <summary>
@@ -89,8 +93,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
     {
         // Filter to only valid entries
         var validEntries = FilterValidEntries(entries);
+        var removalPlan = BuildRemovalPlan(validEntries);
         
-        if (validEntries.Count == 0)
+        if (removalPlan.Count == 0)
         {
             Logger.Error("Registry entry validation failed - no valid entries found to process");
             return new RemovalResult(
@@ -101,7 +106,8 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
                 Duration: TimeSpan.Zero);
         }
         
-        Logger.Info("Processing {ValidCount} valid entries out of {TotalCount} total entries", validEntries.Count, entries.Count);
+        Logger.Info("Processing {RemovalPlanCount} planned registry removals from {ValidCount} valid entries out of {TotalCount} total entries",
+            removalPlan.Count, validEntries.Count, entries.Count);
 
         var stopwatch = Stopwatch.StartNew();
         var errors = new List<string>();
@@ -114,17 +120,8 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             Logger.Info("Creating registry backup at: {BackupPath}", backupPath);
             if (!await CreateBackupAsync(backupPath))
             {
-                Logger.Error("Failed to create registry backup at: {BackupPath}", backupPath);
+                Logger.Warn("Failed to create registry backup at: {BackupPath}; continuing without registry backup", backupPath);
                 errors.Add("Failed to create registry backup");
-                if (!_config.DryRun)
-                {
-                    return new RemovalResult(
-                        TotalEntries: entries.Count,
-                        SuccessfulRemovals: 0,
-                        FailedRemovals: entries.Count,
-                        Errors: errors,
-                        Duration: stopwatch.Elapsed);
-                }
             }
             else
             {
@@ -136,7 +133,7 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
         await StopAutodeskServicesAsync();
 
         // Process each valid entry
-        if (!validEntries.Any())
+        if (!removalPlan.Any())
         {
             Logger.Warn("No valid registry entries to process.");
             return new RemovalResult(
@@ -148,7 +145,7 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             );
         }
 
-        foreach (var entry in validEntries)
+        foreach (var entry in removalPlan)
         {
             try
             {
@@ -182,9 +179,9 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
         stopwatch.Stop();
 
         return new RemovalResult(
-            TotalEntries: validEntries.Count,
+            TotalEntries: removalPlan.Count,
             SuccessfulRemovals: successfulRemovals,
-            FailedRemovals: validEntries.Count - successfulRemovals,
+            FailedRemovals: removalPlan.Count - successfulRemovals,
             Errors: errors,
             Duration: stopwatch.Elapsed);
     }
@@ -354,6 +351,44 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
     }
 
     /// <summary>
+    /// Builds the smallest safe registry removal plan.
+    /// Prefers deleting a parent Autodesk key once instead of deleting each child key/value separately.
+    /// </summary>
+    /// <param name="entries">Validated Autodesk registry entries.</param>
+    /// <returns>The optimized removal plan.</returns>
+    private static List<RegistryEntry> BuildRemovalPlan(IReadOnlyCollection<RegistryEntry> entries)
+    {
+        if (entries.Count == 0)
+        {
+            return [];
+        }
+
+        var orderedEntries = entries
+            .OrderBy(entry => entry.EntryType == RegistryEntryType.Key ? 0 : 1)
+            .ThenBy(entry => entry.KeyPath.Length)
+            .ThenBy(entry => entry.KeyPath, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(entry => entry.ValueName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var plannedEntries = new List<RegistryEntry>();
+
+        foreach (var entry in orderedEntries)
+        {
+            var coveredByParentKey = plannedEntries.Any(plannedEntry =>
+                plannedEntry.RegistryHive == entry.RegistryHive &&
+                plannedEntry.EntryType == RegistryEntryType.Key &&
+                IsSameOrDescendantRegistryPath(entry.KeyPath, plannedEntry.KeyPath));
+
+            if (!coveredByParentKey)
+            {
+                plannedEntries.Add(entry);
+            }
+        }
+
+        return plannedEntries;
+    }
+
+    /// <summary>
     /// Checks if a registry path is under a known Autodesk registry location.
     /// </summary>
     /// <param name="keyPath">The registry key path to check.</param>
@@ -478,45 +513,12 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
     {
         try
         {
-            var hiveKey = entry.RegistryHive switch
-            {
-                RegistryHive.LocalMachine => Registry.LocalMachine,
-                RegistryHive.CurrentUser => Registry.CurrentUser,
-                _ => throw new NotSupportedException($"Registry hive {entry.RegistryHive} not supported")
-            };
-
             if (entry.EntryType == RegistryEntryType.Value)
             {
-                // Remove registry value
-                var keyPath = Path.GetDirectoryName(entry.KeyPath.Replace('\\', Path.DirectorySeparatorChar))?.Replace(Path.DirectorySeparatorChar, '\\');
-                if (keyPath is not null)
-                {
-                    using var key = hiveKey.OpenSubKey(keyPath, true);
-                    if (key is not null && entry.ValueName is not null)
-                    {
-                        key.DeleteValue(entry.ValueName, false);
-                        return Task.FromResult(true);
-                    }
-                }
-            }
-            else
-            {
-                // Remove registry key
-                var parentPath = Path.GetDirectoryName(entry.KeyPath.Replace('\\', Path.DirectorySeparatorChar))?.Replace(Path.DirectorySeparatorChar, '\\');
-                var keyName = Path.GetFileName(entry.KeyPath.Replace('\\', Path.DirectorySeparatorChar));
-                
-                if (parentPath is not null && keyName is not null)
-                {
-                    using var parentKey = hiveKey.OpenSubKey(parentPath, true);
-                    if (parentKey is not null)
-                    {
-                        parentKey.DeleteSubKeyTree(keyName, false);
-                        return Task.FromResult(true);
-                    }
-                }
+                return Task.FromResult(RemoveRegistryValue(entry));
             }
 
-            return Task.FromResult(false);
+            return Task.FromResult(RemoveRegistryKey(entry));
         }
         catch (Exception ex)
         {
@@ -524,6 +526,229 @@ public sealed class AutodeskRegistryScanner : IRegistryScanner, IDisposable
             _errors.Add($"Error removing registry entry {entry.DisplayName}: {ex.Message}");
             return Task.FromResult(false);
         }
+    }
+
+    /// <summary>
+    /// Removes a registry value from its containing key.
+    /// </summary>
+    /// <param name="entry">The registry value entry.</param>
+    /// <returns>True if the value was removed or no longer exists.</returns>
+    private bool RemoveRegistryValue(RegistryEntry entry)
+    {
+        if (entry.ValueName is null)
+        {
+            return false;
+        }
+
+        using var baseKey = OpenBaseKey(entry.RegistryHive);
+        if (TryDeleteRegistryValue(baseKey, entry.KeyPath, entry.ValueName))
+        {
+            return true;
+        }
+
+        if (!TryGrantRegistryFullControl(baseKey, entry.KeyPath))
+        {
+            return false;
+        }
+
+        return TryDeleteRegistryValue(baseKey, entry.KeyPath, entry.ValueName);
+    }
+
+    /// <summary>
+    /// Removes a registry key tree from its parent key.
+    /// </summary>
+    /// <param name="entry">The registry key entry.</param>
+    /// <returns>True if the key was removed or no longer exists.</returns>
+    private bool RemoveRegistryKey(RegistryEntry entry)
+    {
+        var parentPath = GetRegistryParentPath(entry.KeyPath);
+        var keyName = GetRegistryLeafName(entry.KeyPath);
+
+        if (string.IsNullOrWhiteSpace(parentPath) || string.IsNullOrWhiteSpace(keyName))
+        {
+            return false;
+        }
+
+        using var baseKey = OpenBaseKey(entry.RegistryHive);
+        if (TryDeleteRegistryKey(baseKey, parentPath, keyName))
+        {
+            return true;
+        }
+
+        if (!TryGrantRegistryFullControl(baseKey, entry.KeyPath))
+        {
+            return false;
+        }
+
+        TryGrantRegistryFullControl(baseKey, parentPath);
+        return TryDeleteRegistryKey(baseKey, parentPath, keyName);
+    }
+
+    /// <summary>
+    /// Opens a registry base key for the specified hive.
+    /// </summary>
+    /// <param name="hive">The registry hive.</param>
+    /// <returns>The opened base key.</returns>
+    private static RegistryKey OpenBaseKey(RegistryHive hive)
+    {
+        return RegistryKey.OpenBaseKey(hive, RegistryView.Default);
+    }
+
+    /// <summary>
+    /// Attempts to delete a registry value.
+    /// </summary>
+    /// <param name="baseKey">The hive base key.</param>
+    /// <param name="keyPath">The containing key path.</param>
+    /// <param name="valueName">The value to delete.</param>
+    /// <returns>True if the value was removed or did not exist.</returns>
+    private static bool TryDeleteRegistryValue(RegistryKey baseKey, string keyPath, string valueName)
+    {
+        try
+        {
+            using var key = baseKey.OpenSubKey(keyPath, writable: true);
+            if (key is null)
+            {
+                return true;
+            }
+
+            if (key.GetValue(valueName) is null)
+            {
+                return true;
+            }
+
+            key.DeleteValue(valueName, throwOnMissingValue: false);
+            return key.GetValue(valueName) is null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Attempts to delete a registry key tree.
+    /// </summary>
+    /// <param name="baseKey">The hive base key.</param>
+    /// <param name="parentPath">The parent key path.</param>
+    /// <param name="keyName">The subkey to delete.</param>
+    /// <returns>True if the key was removed or did not exist.</returns>
+    private static bool TryDeleteRegistryKey(RegistryKey baseKey, string parentPath, string keyName)
+    {
+        try
+        {
+            using var parentKey = baseKey.OpenSubKey(parentPath, writable: true);
+            if (parentKey is null)
+            {
+                return true;
+            }
+
+            if (!parentKey.GetSubKeyNames().Contains(keyName, StringComparer.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            parentKey.DeleteSubKeyTree(keyName, throwOnMissingSubKey: false);
+            return !parentKey.GetSubKeyNames().Contains(keyName, StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Attempts to take ownership of a registry key and grant the Administrators group full control.
+    /// </summary>
+    /// <param name="baseKey">The hive base key.</param>
+    /// <param name="keyPath">The key path.</param>
+    /// <returns>True if access was updated successfully.</returns>
+    private bool TryGrantRegistryFullControl(RegistryKey baseKey, string keyPath)
+    {
+        try
+        {
+            var administratorsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+            using (var ownershipKey = baseKey.OpenSubKey(
+                       keyPath,
+                       RegistryKeyPermissionCheck.ReadWriteSubTree,
+                       RegistryRights.TakeOwnership | RegistryRights.ReadKey | RegistryRights.ChangePermissions))
+            {
+                if (ownershipKey is null)
+                {
+                    return false;
+                }
+
+                var security = ownershipKey.GetAccessControl(AccessControlSections.Owner);
+                security.SetOwner(administratorsSid);
+                ownershipKey.SetAccessControl(security);
+            }
+
+            using var permissionKey = baseKey.OpenSubKey(
+                keyPath,
+                RegistryKeyPermissionCheck.ReadWriteSubTree,
+                RegistryRights.ChangePermissions | RegistryRights.ReadKey | RegistryRights.FullControl);
+
+            if (permissionKey is null)
+            {
+                return false;
+            }
+
+            var updatedSecurity = permissionKey.GetAccessControl();
+            updatedSecurity.AddAccessRule(new RegistryAccessRule(
+                administratorsSid,
+                RegistryRights.FullControl,
+                InheritanceFlags.ContainerInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            permissionKey.SetAccessControl(updatedSecurity);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Failed to take ownership of registry key {KeyPath}: {Message}", keyPath, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Gets the parent registry path for a key.
+    /// </summary>
+    /// <param name="keyPath">The registry key path.</param>
+    /// <returns>The parent registry path, or null when not available.</returns>
+    private static string? GetRegistryParentPath(string keyPath)
+    {
+        var separatorIndex = keyPath.LastIndexOf('\\');
+        return separatorIndex > 0 ? keyPath[..separatorIndex] : null;
+    }
+
+    /// <summary>
+    /// Gets the leaf key name from a registry path.
+    /// </summary>
+    /// <param name="keyPath">The registry key path.</param>
+    /// <returns>The final key name, or null when not available.</returns>
+    private static string? GetRegistryLeafName(string keyPath)
+    {
+        var separatorIndex = keyPath.LastIndexOf('\\');
+        return separatorIndex >= 0 && separatorIndex < keyPath.Length - 1
+            ? keyPath[(separatorIndex + 1)..]
+            : null;
+    }
+
+    /// <summary>
+    /// Determines whether a registry path is the same as or nested below a parent path.
+    /// </summary>
+    /// <param name="candidatePath">The candidate registry path.</param>
+    /// <param name="parentPath">The parent registry path.</param>
+    /// <returns>True when the candidate is covered by the parent key removal.</returns>
+    private static bool IsSameOrDescendantRegistryPath(string candidatePath, string parentPath)
+    {
+        if (candidatePath.Equals(parentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return candidatePath.StartsWith(parentPath + "\\", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

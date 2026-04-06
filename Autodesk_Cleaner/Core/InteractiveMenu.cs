@@ -507,7 +507,7 @@ public sealed class InteractiveMenu : IDisposable
             MenuOption.ScanFileSystemOnly => "Scan file system for Autodesk files and directories (read-only)",
             MenuOption.ScanBoth => "Scan both registry and file system for Autodesk entries (read-only)",
             MenuOption.DryRunCleanup => "Simulate complete Autodesk cleanup without making changes",
-            MenuOption.ActualCleanup => "Perform actual cleanup - PERMANENTLY DELETE Autodesk entries",
+            MenuOption.ActualCleanup => "Perform actual cleanup - PERMANENTLY DELETE Autodesk services, installer registrations, licensing state, files, and registry entries",
             MenuOption.ConfigureBackup => "Configure backup settings and locations",
             MenuOption.ViewConfiguration => "Display current application configuration",
             MenuOption.Repair3dsMax2027Licensing => "Repair stale Autodesk network-license settings for 3ds Max 2027 named-user licensing",
@@ -533,6 +533,8 @@ public sealed class InteractiveMenu : IDisposable
             ],
             MenuOption.ActualCleanup => [
                 "ALL Autodesk software will be permanently removed",
+                "Autodesk installer registrations will be permanently deleted",
+                "Autodesk licensing and FLEXlm overrides will be removed",
                 "Registry entries will be permanently deleted",
                 "Autodesk project files may become inaccessible",
                 "System restore may not recover all deleted items",

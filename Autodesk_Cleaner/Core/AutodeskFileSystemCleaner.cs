@@ -204,30 +204,24 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         var errors = new List<string>();
         var successfulRemovals = 0;
 
-        // Create backup if requested
-        if (_config.CreateBackup)
-        {
-            var backupPath = Path.Combine(_config.BackupPath, $"files_backup_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
-            if (!await CreateBackupAsync(backupPath, entries))
-            {
-                errors.Add("Failed to create file system backup");
-                if (!_config.DryRun)
-                {
-                    return new RemovalResult(
-                        TotalEntries: entries.Count,
-                        SuccessfulRemovals: 0,
-                        FailedRemovals: entries.Count,
-                        Errors: errors,
-                        Duration: stopwatch.Elapsed);
-                }
-            }
-        }
-
         // Stop Autodesk services before deletion
+        if (!_config.DryRun)
+        {
+            AnsiConsole.MarkupLine("[yellow]Stopping Autodesk services that can block deletion...[/]");
+        }
         await StopAutodeskServicesAsync();
         
         // Kill any remaining Autodesk processes
+        if (!_config.DryRun)
+        {
+            AnsiConsole.MarkupLine("[yellow]Killing Autodesk processes still holding files open...[/]");
+        }
         await KillAllAutodeskProcessesAsync();
+
+        if (!_config.DryRun)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Beginning removal plan for {removalPlan.Count} top-level entries...[/]");
+        }
         
         // Process each valid entry
         if (!removalPlan.Any())
@@ -245,28 +239,33 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         // Progress reporting setup
         var processedCount = 0;
         var totalCount = removalPlan.Count;
-        var progressReportInterval = Math.Max(1, totalCount / 100); // Report every 1% or at least every entry
+        var completedDirectoryRemovals = 0;
+        var completedFileRemovals = 0;
+        var failedRemovals = 0;
         
         Logger.Info("Starting removal of {TotalCount} file system entries", totalCount);
+
+        if (!_config.DryRun)
+        {
+            AnsiConsole.MarkupLine(
+                $"[bold yellow]Cleanup progress:[/] 0/{totalCount} processed | directories deleted: 0 | files deleted: 0 | failed: 0 | ETA: calculating...");
+        }
         
         foreach (var entry in removalPlan)
         {
             try
             {
                 processedCount++;
+                var operationLabel = entry.EntryType == FileSystemEntryType.Directory ? "directory tree" : "file";
+                var progressPercentage = (double)processedCount / totalCount * 100;
+                var etaText = FormatEta(stopwatch.Elapsed, processedCount, totalCount);
                 
-                // Progress reporting
-                if (processedCount % progressReportInterval == 0 || processedCount == totalCount)
+                if (!_config.DryRun)
                 {
-                    var progressPercentage = (double)processedCount / totalCount * 100;
-                    Logger.Info("Processing file system entries: {ProcessedCount}/{TotalCount} ({ProgressPercentage:F1}%)", 
-                        processedCount, totalCount, progressPercentage);
-                    
-                    if (!_config.DryRun)
-                    {
-                        // Simple console output for visible progress
-                        AnsiConsole.WriteLine($"Progress: {processedCount}/{totalCount} ({progressPercentage:F1}%) - {entry.DisplayName}");
-                    }
+                    Logger.Info("Processing file system entries: {ProcessedCount}/{TotalCount} ({ProgressPercentage:F1}%) ETA {Eta}",
+                        processedCount, totalCount, progressPercentage, etaText);
+                    AnsiConsole.MarkupLine(
+                        $"[cyan]Working on {operationLabel} {processedCount}/{totalCount} ({progressPercentage:F1}%):[/] {Markup.Escape(entry.Path)} [dim]| ETA {etaText}[/]");
                 }
                 
                 if (_config.DryRun)
@@ -287,11 +286,36 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                 {
                     Logger.Debug("Successfully removed file system entry: {Path}", entry.Path);
                     successfulRemovals++;
+                    if (entry.EntryType == FileSystemEntryType.Directory)
+                    {
+                        completedDirectoryRemovals++;
+                    }
+                    else
+                    {
+                        completedFileRemovals++;
+                    }
+
+                    if (!_config.DryRun)
+                    {
+                        AnsiConsole.MarkupLine(
+                            $"[green]Completed {operationLabel} removal {processedCount}/{totalCount}:[/] {Markup.Escape(entry.Path)}");
+                        AnsiConsole.MarkupLine(
+                            $"[dim]Progress:[/] {processedCount}/{totalCount} processed | directories deleted: {completedDirectoryRemovals} | files deleted: {completedFileRemovals} | failed: {failedRemovals} | ETA: {FormatEta(stopwatch.Elapsed, processedCount, totalCount)}");
+                    }
                 }
                 else
                 {
                     Logger.Warn("Failed to remove file system entry: {Path}", entry.Path);
                     errors.Add($"Failed to remove: {entry.Path}");
+                    failedRemovals++;
+
+                    if (!_config.DryRun)
+                    {
+                        AnsiConsole.MarkupLine(
+                            $"[red]Failed {operationLabel} removal {processedCount}/{totalCount}:[/] {Markup.Escape(entry.Path)}");
+                        AnsiConsole.MarkupLine(
+                            $"[dim]Progress:[/] {processedCount}/{totalCount} processed | directories deleted: {completedDirectoryRemovals} | files deleted: {completedFileRemovals} | failed: {failedRemovals} | ETA: {FormatEta(stopwatch.Elapsed, processedCount, totalCount)}");
+                    }
                 }
                 
                 // Yield control periodically to prevent UI freezing
@@ -304,6 +328,15 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 Logger.Error(ex, "Error removing file system entry {Path}: {Message}", entry.Path, ex.Message);
                 errors.Add($"Error removing {entry.Path}: {ex.Message}");
+                failedRemovals++;
+
+                if (!_config.DryRun)
+                {
+                    AnsiConsole.MarkupLine(
+                        $"[red]Error removing entry {processedCount}/{totalCount}:[/] {Markup.Escape(entry.Path)} [dim]({Markup.Escape(ex.Message)})[/]");
+                    AnsiConsole.MarkupLine(
+                        $"[dim]Progress:[/] {processedCount}/{totalCount} processed | directories deleted: {completedDirectoryRemovals} | files deleted: {completedFileRemovals} | failed: {failedRemovals} | ETA: {FormatEta(stopwatch.Elapsed, processedCount, totalCount)}");
+                }
             }
         }
         
@@ -323,44 +356,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     /// <inheritdoc />
     public async Task<bool> CreateBackupAsync(string backupPath, IReadOnlyCollection<FileSystemEntry> entries)
     {
-        try
-        {
-            var directory = Path.GetDirectoryName(backupPath);
-            if (!string.IsNullOrEmpty(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            using var zipFile = new FileStream(backupPath, FileMode.Create);
-            using var archive = new ZipArchive(zipFile, ZipArchiveMode.Create);
-
-            foreach (var entry in entries.Where(e => e.EntryType == FileSystemEntryType.File))
-            {
-                try
-                {
-                    if (File.Exists(entry.Path))
-                    {
-                        var relativePath = entry.Path.Replace(@":\", "_").Replace(@"\", "_");
-                        var zipEntry = archive.CreateEntry(relativePath);
-                        
-                        using var fileStream = new FileStream(entry.Path, FileMode.Open, FileAccess.Read);
-                        using var zipStream = zipEntry.Open();
-                        await fileStream.CopyToAsync(zipStream);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _errors.Add($"Error backing up {entry.Path}: {ex.Message}");
-                }
-            }
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _errors.Add($"Backup creation failed: {ex.Message}");
-            return false;
-        }
+        Logger.Info("File system backup creation is disabled; skipping backup request for {EntryCount} entries", entries.Count);
+        await Task.CompletedTask;
+        return true;
     }
 
     /// <inheritdoc />
@@ -1139,6 +1137,13 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 try
                 {
+                    if (process.Id == Environment.ProcessId)
+                    {
+                        Logger.Warn("Skipping current cleaner process while resolving file lock: {ProcessName} (PID: {ProcessId})",
+                            process.ProcessName, process.Id);
+                        continue;
+                    }
+
                     if (ProtectedProcesses.Contains(process.ProcessName))
                     {
                         Logger.Debug("Skipping protected system process: {ProcessName} (PID: {ProcessId})", 
@@ -1205,9 +1210,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 return ParseHandleOutput(handleOutput);
             }
-            
-            // Fallback: Use WMI to find processes with open file handles
-            return await GetProcessesUsingFileWmiAsync(filePath);
+
+            Logger.Debug("Skipping heuristic WMI lock detection for {FilePath} because handle.exe is unavailable", filePath);
+            return processesUsingFile;
         }
         catch (Exception ex)
         {
@@ -1290,63 +1295,6 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         {
             // Note: Using static reference since this is a static method
             LogManager.GetCurrentClassLogger().Debug(ex, "Error parsing handle.exe output: {Message}", ex.Message);
-        }
-        
-        return processes;
-    }
-
-    /// <summary>
-    /// Uses WMI to find processes that might be using a file (fallback method).
-    /// </summary>
-    /// <param name="filePath">The file path to check.</param>
-    /// <returns>A list of processes that might be using the file.</returns>
-    private async Task<List<Process>> GetProcessesUsingFileWmiAsync(string filePath)
-    {
-        var processes = new List<Process>();
-        
-        try
-        {
-            await Task.Run(() =>
-            {
-                using var searcher = new ManagementObjectSearcher("SELECT ProcessId, Name FROM Win32_Process");
-                using var results = searcher.Get();
-                
-                foreach (ManagementObject result in results)
-                {
-                    try
-                    {
-                        var processId = Convert.ToInt32(result["ProcessId"]);
-                        var processName = result["Name"]?.ToString();
-                        
-                        if (processName != null && !ProtectedProcesses.Contains(processName))
-                        {
-                            // Check if this process might be related to Autodesk or the file directory
-                            var fileDirectory = Path.GetDirectoryName(filePath);
-                            if (processName.Contains("autodesk", StringComparison.OrdinalIgnoreCase) ||
-                                (fileDirectory != null && processName.Contains(Path.GetFileName(fileDirectory), StringComparison.OrdinalIgnoreCase)))
-                            {
-                                try
-                                {
-                                    var process = Process.GetProcessById(processId);
-                                    processes.Add(process);
-                                }
-                                catch
-                                {
-                                    // Process may have exited
-                                }
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // Skip invalid processes
-                    }
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            Logger.Debug(ex, "Error using WMI to find processes: {Message}", ex.Message);
         }
         
         return processes;
@@ -1523,9 +1471,14 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
 
         try
         {
-            ClearDirectoryAttributes(directoryPath);
-            Directory.Delete(directoryPath, true);
-            return true;
+            return await RunWithHeartbeatAsync(
+                $"Deleting directory tree {directoryPath}",
+                async () =>
+                {
+                    ClearDirectoryAttributes(directoryPath);
+                    await ForceDeleteDirectoryContentsAsync(directoryPath);
+                    return !Directory.Exists(directoryPath);
+                });
         }
         catch (Exception ex) when (IsAccessOrLockException(ex))
         {
@@ -1536,7 +1489,13 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
 
             try
             {
-                await ForceDeleteDirectoryContentsAsync(directoryPath);
+                await RunWithHeartbeatAsync(
+                    $"Force deleting directory tree {directoryPath}",
+                    async () =>
+                    {
+                        await ForceDeleteDirectoryContentsAsync(directoryPath);
+                        return true;
+                    });
                 return !Directory.Exists(directoryPath);
             }
             catch (Exception retryEx)
@@ -1765,6 +1724,68 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                ioException.Message.Contains("access is denied", StringComparison.OrdinalIgnoreCase) ||
                ioException.Message.Contains("being used by another process", StringComparison.OrdinalIgnoreCase) ||
                ioException.Message.Contains("cannot access the file", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Runs a long operation and periodically reports that it is still active.
+    /// </summary>
+    /// <typeparam name="T">The operation result type.</typeparam>
+    /// <param name="description">The operation description.</param>
+    /// <param name="operation">The operation to run.</param>
+    /// <returns>The operation result.</returns>
+    private async Task<T> RunWithHeartbeatAsync<T>(string description, Func<Task<T>> operation)
+    {
+        var operationTask = operation();
+        var stopwatch = Stopwatch.StartNew();
+        var heartbeatInterval = TimeSpan.FromSeconds(3);
+
+        while (!operationTask.IsCompleted)
+        {
+            var completedTask = await Task.WhenAny(operationTask, Task.Delay(heartbeatInterval));
+            if (completedTask != operationTask)
+            {
+                Logger.Info("{Description} is still in progress ({ElapsedSeconds:F0}s elapsed)", description, stopwatch.Elapsed.TotalSeconds);
+
+                if (!_config.DryRun)
+                {
+                    AnsiConsole.MarkupLine(
+                        $"[dim]{Markup.Escape(description)} still in progress ({stopwatch.Elapsed.TotalSeconds:F0}s elapsed)...[/]");
+                }
+            }
+        }
+
+        return await operationTask;
+    }
+
+    /// <summary>
+    /// Formats an estimated remaining duration from elapsed work and completed item count.
+    /// </summary>
+    /// <param name="elapsed">Elapsed processing time.</param>
+    /// <param name="processedCount">Completed item count.</param>
+    /// <param name="totalCount">Total item count.</param>
+    /// <returns>Human-readable ETA text.</returns>
+    private static string FormatEta(TimeSpan elapsed, int processedCount, int totalCount)
+    {
+        if (processedCount <= 0 || totalCount <= processedCount)
+        {
+            return processedCount >= totalCount ? "done" : "calculating...";
+        }
+
+        var averageSecondsPerItem = elapsed.TotalSeconds / processedCount;
+        var remainingSeconds = Math.Max(0, (totalCount - processedCount) * averageSecondsPerItem);
+        var remaining = TimeSpan.FromSeconds(remainingSeconds);
+
+        if (remaining.TotalHours >= 1)
+        {
+            return $"{(int)remaining.TotalHours}h {remaining.Minutes}m";
+        }
+
+        if (remaining.TotalMinutes >= 1)
+        {
+            return $"{remaining.Minutes}m {remaining.Seconds}s";
+        }
+
+        return $"{Math.Max(1, remaining.Seconds)}s";
     }
     
 

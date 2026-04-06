@@ -1,8 +1,10 @@
 using Autodesk_Cleaner.Core;
 using Microsoft.Win32;
 using System.Diagnostics;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.ServiceProcess;
+using System.Text.RegularExpressions;
 using NLog;
 using Spectre.Console;
 
@@ -18,8 +20,23 @@ internal static class Program
     private const string AdskNetworkLicenseServiceName = "AdskNLM";
     private const string ThreeDsMax2027ProductKey = "128S1";
     private const string ThreeDsMax2027ProductVersion = "2027.0.0.F";
+    private static readonly Regex AutodeskServicePattern = new(
+        @"(autodesk|adsk|3ds\s*max|maya|revit|inventor|navisworks|motionbuilder|mudbox|alias|genuine)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly HashSet<string> KnownAutodeskServiceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "AdskLicensingService",
+        "AdskAccessServiceHost",
+        "AdAppMgrSvc",
+        "Mi-Service",
+        "AdskNLM",
+        "AGSService",
+        "AutodeskDesktopAppService"
+    };
 
     private readonly record struct LicenseRepairStep(string Step, string Status, string Details);
+    private readonly record struct AutodeskServiceInfo(string ServiceName, string DisplayName, ServiceControllerStatus Status);
+    private readonly record struct ServiceCleanupResult(int TotalServices, int RemovedServices, IReadOnlyCollection<string> Errors);
 
     /// <summary>
     /// Main entry point for the application.
@@ -809,8 +826,52 @@ internal static class Program
                 AnsiConsole.MarkupLine("[bold red]LIVE MODE - Changes will be permanent[/]");
             }
 
-            // Phase 1: Registry Cleanup
-            AnsiConsole.Write(new Rule("[bold blue]Phase 1: Registry Cleanup[/]"));
+            // Phase 0: Service Cleanup
+            AnsiConsole.Write(new Rule("[bold blue]Phase 0: Service Cleanup[/]"));
+
+            var serviceCleanupResult = await CleanupAutodeskServicesAsync(config.DryRun);
+            DisplayServiceCleanupResult(serviceCleanupResult, config.DryRun);
+
+            if (!config.DryRun && serviceCleanupResult.Errors.Count > 0)
+            {
+                overallSuccess = false;
+                totalErrors.AddRange(serviceCleanupResult.Errors);
+            }
+
+            // Phase 1: Licensing Cleanup
+            AnsiConsole.Write(new Rule("[bold blue]Phase 1: Licensing Cleanup[/]"));
+
+            AnsiConsole.MarkupLine("[green]Cleaning Autodesk licensing overrides...[/]");
+            AutodeskLicensingCleanupResult licensingResult;
+            var licensingCleaner = new AutodeskLicensingCleaner(config);
+            licensingResult = await licensingCleaner.CleanupAsync();
+
+            DisplayLicensingCleanupResult(licensingResult, config.DryRun);
+
+            if (!licensingResult.IsSuccessful)
+            {
+                overallSuccess = false;
+                totalErrors.AddRange(licensingResult.Errors);
+            }
+
+            // Phase 2: MSI Registration Cleanup
+            AnsiConsole.Write(new Rule("[bold blue]Phase 2: Installer Registration Cleanup[/]"));
+
+            AnsiConsole.MarkupLine("[green]Cleaning Autodesk Windows Installer registrations...[/]");
+            BrokenMsiCleanupResult msiCleanupResult;
+            var msiRegistrationCleaner = new BrokenMsiRegistrationCleaner(config);
+            msiCleanupResult = await msiRegistrationCleaner.CleanupAsync();
+
+            DisplayMsiCleanupResult(msiCleanupResult, config.DryRun);
+
+            if (!msiCleanupResult.IsSuccessful)
+            {
+                overallSuccess = false;
+                totalErrors.AddRange(msiCleanupResult.Errors);
+            }
+
+            // Phase 3: Registry Cleanup
+            AnsiConsole.Write(new Rule("[bold blue]Phase 3: Registry Cleanup[/]"));
             
             AnsiConsole.MarkupLine("[green]Scanning registry for Autodesk entries...[/]");
             IReadOnlyCollection<RegistryEntry> registryEntries;
@@ -834,12 +895,12 @@ internal static class Program
             {
                 DisplayRegistryResults(registryEntries);
                 
-                var registryResult = await AnsiConsole.Status()
-                    .StartAsync("[yellow]Processing registry entries...[/]", async ctx =>
-                    {
-                        using var registryScanner = new AutodeskRegistryScanner(config);
-                        return await registryScanner.RemoveEntriesAsync(registryEntries);
-                    });
+                AnsiConsole.MarkupLine("[yellow]Processing registry entries...[/]");
+                RemovalResult registryResult;
+                using (var registryScanner = new AutodeskRegistryScanner(config))
+                {
+                    registryResult = await registryScanner.RemoveEntriesAsync(registryEntries);
+                }
                     
                 DisplayRemovalResult("Registry", registryResult);
                 
@@ -854,8 +915,8 @@ internal static class Program
                 AnsiConsole.MarkupLine("[dim]No registry entries found to clean.[/]");
             }
 
-            // Phase 2: File System Cleanup
-            AnsiConsole.Write(new Rule("[bold blue]Phase 2: File System Cleanup[/]"));
+            // Phase 4: File System Cleanup
+            AnsiConsole.Write(new Rule("[bold blue]Phase 4: File System Cleanup[/]"));
             
             AnsiConsole.MarkupLine("[green]Scanning file system for Autodesk files and directories...[/]");
             IReadOnlyCollection<FileSystemEntry> fileSystemEntries;
@@ -908,6 +969,496 @@ internal static class Program
         {
             AnsiConsole.WriteException(ex);
             return -1;
+        }
+    }
+
+    /// <summary>
+    /// Finds and removes installed Autodesk-related Windows services.
+    /// </summary>
+    private static async Task<ServiceCleanupResult> CleanupAutodeskServicesAsync(bool dryRun)
+    {
+        var services = DiscoverAutodeskServices();
+        var errors = new List<string>();
+
+        if (services.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[dim]No Autodesk services are currently registered.[/]");
+            return new ServiceCleanupResult(0, 0, errors);
+        }
+
+        AnsiConsole.MarkupLine($"[green]Found {services.Count} Autodesk-related services.[/]");
+
+        var removedServices = 0;
+        var index = 0;
+        foreach (var service in services)
+        {
+            index++;
+
+            if (dryRun)
+            {
+                AnsiConsole.MarkupLine(
+                    $"[dim][DRY RUN] Would remove service {index}/{services.Count}:[/] {Markup.Escape(service.ServiceName)} [dim]({Markup.Escape(service.DisplayName)})[/]");
+                removedServices++;
+                continue;
+            }
+
+            AnsiConsole.MarkupLine(
+                $"[yellow]Removing service {index}/{services.Count}:[/] {Markup.Escape(service.ServiceName)} [dim]({Markup.Escape(service.DisplayName)})[/]");
+
+            var removed = await RemoveServiceAsync(service);
+            if (removed)
+            {
+                removedServices++;
+                AnsiConsole.MarkupLine($"[green]Removed service:[/] {Markup.Escape(service.ServiceName)}");
+            }
+            else
+            {
+                var error = $"Failed to remove service: {service.ServiceName}";
+                errors.Add(error);
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(error)}[/]");
+            }
+        }
+
+        return new ServiceCleanupResult(services.Count, removedServices, errors);
+    }
+
+    /// <summary>
+    /// Displays service cleanup results.
+    /// </summary>
+    private static void DisplayServiceCleanupResult(ServiceCleanupResult result, bool isDryRun)
+    {
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = result.Errors.Count == 0 ? new Style(Color.Green) : new Style(Color.Yellow)
+        };
+
+        table.AddColumn("[bold]Metric[/]");
+        table.AddColumn("[bold]Value[/]");
+        table.AddRow("Services Found", result.TotalServices.ToString());
+        table.AddRow(isDryRun ? "Services Planned" : "Services Removed", $"[green]{result.RemovedServices}[/]");
+        table.AddRow("Failed Removals", result.Errors.Count > 0 ? $"[red]{result.Errors.Count}[/]" : "0");
+
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader($" [bold {(result.Errors.Count == 0 ? "green" : "yellow")}]SERVICE CLEANUP RESULTS[/] "),
+            Border = BoxBorder.Rounded
+        };
+
+        AnsiConsole.Write(panel);
+
+        if (result.Errors.Count > 0)
+        {
+            var errorPanel = new Panel(string.Join("\n", result.Errors.Select(error => $"[red]• {Markup.Escape(error)}[/]")))
+            {
+                Header = new PanelHeader(" [bold red]Service Cleanup Errors[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Red)
+            };
+
+            AnsiConsole.Write(errorPanel);
+        }
+    }
+
+    /// <summary>
+    /// Displays Autodesk licensing cleanup results.
+    /// </summary>
+    private static void DisplayLicensingCleanupResult(AutodeskLicensingCleanupResult result, bool isDryRun)
+    {
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = result.IsSuccessful ? new Style(Color.Green) : new Style(Color.Yellow)
+        };
+
+        table.AddColumn("[bold]Step[/]");
+        table.AddColumn("[bold]Status[/]");
+        table.AddColumn("[bold]Details[/]");
+
+        foreach (var step in result.Steps)
+        {
+            var statusColor = step.Status switch
+            {
+                "Removed" or "Applied" => "green",
+                "Planned" => "yellow",
+                "Not present" or "Not installed" or "Skipped" => "grey",
+                _ => "red"
+            };
+
+            table.AddRow(
+                Markup.Escape(step.Step),
+                $"[{statusColor}]{Markup.Escape(step.Status)}[/]",
+                Markup.Escape(step.Details));
+        }
+
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader($" [bold {(result.IsSuccessful ? "green" : "yellow")}]LICENSING CLEANUP {(isDryRun ? "PLAN" : "RESULTS")}[/] "),
+            Border = BoxBorder.Rounded
+        };
+
+        AnsiConsole.Write(panel);
+    }
+
+    /// <summary>
+    /// Displays Autodesk MSI cleanup results.
+    /// </summary>
+    private static void DisplayMsiCleanupResult(BrokenMsiCleanupResult result, bool isDryRun)
+    {
+        var summaryTable = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = result.IsSuccessful ? new Style(Color.Green) : new Style(Color.Yellow)
+        };
+
+        summaryTable.AddColumn("[bold]Metric[/]");
+        summaryTable.AddColumn("[bold]Value[/]");
+        summaryTable.AddRow("Autodesk MSI Registrations", result.Candidates.Count.ToString());
+        summaryTable.AddRow(isDryRun ? "Planned Removals" : "Successful Removals", result.SuccessfulRemovals.ToString());
+        summaryTable.AddRow("Running msiexec", result.RunningMsiexec.Count.ToString());
+        summaryTable.AddRow("Errors", result.Errors.Count.ToString());
+
+        var summaryPanel = new Panel(summaryTable)
+        {
+            Header = new PanelHeader($" [bold {(result.IsSuccessful ? "green" : "yellow")}]INSTALLER CLEANUP {(isDryRun ? "PLAN" : "RESULTS")}[/] "),
+            Border = BoxBorder.Rounded
+        };
+
+        AnsiConsole.Write(summaryPanel);
+
+        if (result.Candidates.Count > 0)
+        {
+            var candidateTable = new Table()
+            {
+                Border = TableBorder.Rounded,
+                BorderStyle = new Style(Color.Blue)
+            };
+
+            candidateTable.AddColumn("[bold]Product[/]");
+            candidateTable.AddColumn("[bold]Packed Key[/]");
+            candidateTable.AddColumn("[bold]Reason[/]");
+
+            foreach (var candidate in result.Candidates.Take(12))
+            {
+                candidateTable.AddRow(
+                    Markup.Escape(candidate.DisplayName),
+                    Markup.Escape(candidate.PackedProductCode),
+                    Markup.Escape(candidate.Reasons.FirstOrDefault() ?? "Autodesk installer registration"));
+            }
+
+            if (result.Candidates.Count > 12)
+            {
+                candidateTable.AddRow($"[dim]... and {result.Candidates.Count - 12} more[/]", string.Empty, string.Empty);
+            }
+
+            AnsiConsole.Write(new Panel(candidateTable)
+            {
+                Header = new PanelHeader(" [bold blue]Installer Registrations Selected[/] "),
+                Border = BoxBorder.Rounded
+            });
+        }
+
+        if (result.RunningMsiexec.Count > 0)
+        {
+            var msiexecLines = result.RunningMsiexec.Select(process =>
+            {
+                var tag = process.IsAutodeskRelated ? "[yellow]Autodesk-related[/]" : "[red]Non-Autodesk[/]";
+                var commandLine = string.IsNullOrWhiteSpace(process.CommandLine) ? "<no command line>" : process.CommandLine;
+                return $"{tag} PID {process.ProcessId}: {Markup.Escape(commandLine)}";
+            });
+
+            AnsiConsole.Write(new Panel(string.Join('\n', msiexecLines))
+            {
+                Header = new PanelHeader(" [bold yellow]Running msiexec Processes[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Yellow)
+            });
+        }
+
+        if (result.Errors.Count > 0)
+        {
+            AnsiConsole.Write(new Panel(string.Join('\n', result.Errors.Select(error => $"[red]• {Markup.Escape(error)}[/]")))
+            {
+                Header = new PanelHeader(" [bold red]Installer Cleanup Errors[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Red)
+            });
+        }
+    }
+
+    /// <summary>
+    /// Discovers installed Autodesk-related Windows services.
+    /// </summary>
+    private static List<AutodeskServiceInfo> DiscoverAutodeskServices()
+    {
+        var services = new List<AutodeskServiceInfo>();
+
+        foreach (var service in ServiceController.GetServices())
+        {
+            using (service)
+            {
+                var serviceName = service.ServiceName ?? string.Empty;
+                var displayName = service.DisplayName ?? string.Empty;
+
+                if (KnownAutodeskServiceNames.Contains(serviceName) ||
+                    AutodeskServicePattern.IsMatch(serviceName) ||
+                    AutodeskServicePattern.IsMatch(displayName))
+                {
+                    services.Add(new AutodeskServiceInfo(serviceName, displayName, service.Status));
+                }
+            }
+        }
+
+        return services
+            .OrderBy(service => service.ServiceName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Removes a Windows service from the SCM and service registry hive.
+    /// </summary>
+    private static async Task<bool> RemoveServiceAsync(AutodeskServiceInfo service)
+    {
+        try
+        {
+            await StopServiceForRemovalAsync(service.ServiceName);
+            await RunProcessAsync("sc.exe", $"delete \"{service.ServiceName}\"");
+
+            var registryDeleted = TryDeleteServiceRegistryKey(service.ServiceName);
+            var stillRegistered = IsServiceRegistered(service.ServiceName);
+
+            if (stillRegistered)
+            {
+                _logger?.Warn("Service {ServiceName} still appears registered after deletion attempt", service.ServiceName);
+            }
+
+            return !stillRegistered || registryDeleted;
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Failed to remove service {ServiceName}", service.ServiceName);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Stops a service and force-kills its backing process if needed.
+    /// </summary>
+    private static async Task StopServiceForRemovalAsync(string serviceName)
+    {
+        try
+        {
+            using var service = new ServiceController(serviceName);
+            if (service.Status is ServiceControllerStatus.Stopped or ServiceControllerStatus.StopPending)
+            {
+                await WaitForServiceStoppedAsync(serviceName, TimeSpan.FromSeconds(15));
+                return;
+            }
+
+            if (service.CanStop)
+            {
+                service.Stop();
+                await WaitForServiceStoppedAsync(serviceName, TimeSpan.FromSeconds(15));
+                return;
+            }
+        }
+        catch
+        {
+            // Fall through to command-line stop/kill.
+        }
+
+        await RunProcessAsync("sc.exe", $"stop \"{serviceName}\"");
+        await WaitForServiceStoppedAsync(serviceName, TimeSpan.FromSeconds(10));
+
+        var servicePid = await GetServiceProcessIdAsync(serviceName);
+        if (servicePid > 0 && servicePid != Environment.ProcessId)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(servicePid);
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: false);
+                    await process.WaitForExitAsync();
+                }
+            }
+            catch
+            {
+                // Best effort only.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Waits for a service to stop without relying on ServiceController.WaitForStatus, which can throw during deletion races.
+    /// </summary>
+    private static async Task WaitForServiceStoppedAsync(string serviceName, TimeSpan timeout)
+    {
+        var startedAt = DateTime.UtcNow;
+
+        while (DateTime.UtcNow - startedAt < timeout)
+        {
+            try
+            {
+                using var service = new ServiceController(serviceName);
+                service.Refresh();
+
+                if (service.Status == ServiceControllerStatus.Stopped)
+                {
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Service disappeared from SCM while stopping; treat as stopped for cleanup purposes.
+                return;
+            }
+            catch
+            {
+                // Best effort only. Fall back to timeout behavior.
+            }
+
+            await Task.Delay(500);
+        }
+    }
+
+    /// <summary>
+    /// Gets the process ID for a service using sc queryex.
+    /// </summary>
+    private static async Task<int> GetServiceProcessIdAsync(string serviceName)
+    {
+        var (success, standardOutput, _) = await RunProcessAsync("sc.exe", $"queryex \"{serviceName}\"");
+        if (!success)
+        {
+            return 0;
+        }
+
+        foreach (var line in standardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmedLine = line.Trim();
+            if (!trimmedLine.StartsWith("PID", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var parts = trimmedLine.Split(':', 2);
+            if (parts.Length == 2 && int.TryParse(parts[1].Trim(), out var pid))
+            {
+                return pid;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Checks whether a service still exists in the SCM.
+    /// </summary>
+    private static bool IsServiceRegistered(string serviceName)
+    {
+        return ServiceController.GetServices()
+            .Any(service => string.Equals(service.ServiceName, serviceName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Deletes a service registry key, taking ownership if required.
+    /// </summary>
+    private static bool TryDeleteServiceRegistryKey(string serviceName)
+    {
+        const string servicesRoot = @"SYSTEM\CurrentControlSet\Services";
+        var serviceKeyPath = $@"{servicesRoot}\{serviceName}";
+
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+            if (TryDeleteRegistrySubKey(baseKey, servicesRoot, serviceName))
+            {
+                return true;
+            }
+
+            if (!TryGrantRegistryFullControl(baseKey, serviceKeyPath))
+            {
+                return false;
+            }
+
+            TryGrantRegistryFullControl(baseKey, servicesRoot);
+            return TryDeleteRegistrySubKey(baseKey, servicesRoot, serviceName);
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Failed to delete service registry key for {ServiceName}", serviceName);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a registry subkey tree if present.
+    /// </summary>
+    private static bool TryDeleteRegistrySubKey(RegistryKey baseKey, string parentPath, string keyName)
+    {
+        using var parentKey = baseKey.OpenSubKey(parentPath, writable: true);
+        if (parentKey is null)
+        {
+            return true;
+        }
+
+        if (!parentKey.GetSubKeyNames().Contains(keyName, StringComparer.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        parentKey.DeleteSubKeyTree(keyName, throwOnMissingSubKey: false);
+        return !parentKey.GetSubKeyNames().Contains(keyName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Grants the Administrators group full control to a registry key.
+    /// </summary>
+    private static bool TryGrantRegistryFullControl(RegistryKey baseKey, string keyPath)
+    {
+        try
+        {
+            var administratorsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+            using (var ownershipKey = baseKey.OpenSubKey(
+                       keyPath,
+                       RegistryKeyPermissionCheck.ReadWriteSubTree,
+                       RegistryRights.TakeOwnership | RegistryRights.ReadKey | RegistryRights.ChangePermissions))
+            {
+                if (ownershipKey is null)
+                {
+                    return false;
+                }
+
+                var security = ownershipKey.GetAccessControl(AccessControlSections.Owner);
+                security.SetOwner(administratorsSid);
+                ownershipKey.SetAccessControl(security);
+            }
+
+            using var permissionKey = baseKey.OpenSubKey(
+                keyPath,
+                RegistryKeyPermissionCheck.ReadWriteSubTree,
+                RegistryRights.ChangePermissions | RegistryRights.ReadKey | RegistryRights.FullControl);
+
+            if (permissionKey is null)
+            {
+                return false;
+            }
+
+            var updatedSecurity = permissionKey.GetAccessControl();
+            updatedSecurity.AddAccessRule(new RegistryAccessRule(
+                administratorsSid,
+                RegistryRights.FullControl,
+                InheritanceFlags.ContainerInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            permissionKey.SetAccessControl(updatedSecurity);
+
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
