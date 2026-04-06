@@ -8,6 +8,9 @@ Autodesk Cleaner is a command-line utility for cleaning up redundant Autodesk-re
 - **Backup Creation**: Backs up registry entries before deletion to ensure data safety.
 - **Service Management**: Stops Autodesk-related services to unlock files and registry keys during cleanup.
 - **Process Management**: Identifies and terminates processes locking Autodesk files.
+- **2027 Installer Cleanup**: Scans extracted Autodesk installer media in `C:\Autodesk` alongside standard product locations.
+- **Ownership Recovery**: Takes ownership and repairs ACLs when Autodesk files or folders are locked or access is denied.
+- **License Repair Option**: Repairs stale 3ds Max 2027 network-license overrides for named-user installs.
 - **Detailed Logging**: Provides verbose logs to track cleanup processes and errors.
 - **Dry Run Option**: Allows users to preview changes without making actual modifications.
 - **Configurable Paths**: Scans and cleans paths configurable via a settings file.

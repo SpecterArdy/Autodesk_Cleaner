@@ -20,61 +20,68 @@ public static class LoggingConfiguration
     {
         try
         {
+            var resolvedConfigPath = ResolveConfigurationPath(configPath);
+            var configDirectory = Path.GetDirectoryName(resolvedConfigPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+            var logDirectory = Path.Combine(configDirectory, "logs");
+            var archiveDirectory = Path.Combine(logDirectory, "archive");
+
             // Register our custom TOML target with modern NLog API
             LogManager.Setup().SetupExtensions(s => s.RegisterTarget<TomlFileTarget>("TomlFile"));
             
-            AnsiConsole.WriteLine($"[DEBUG] Looking for nlog config at: {Path.GetFullPath(configPath)}");
-            if (!File.Exists(configPath))
+            WriteDiagnostic($"Looking for nlog config at: {resolvedConfigPath}");
+            if (!File.Exists(resolvedConfigPath))
             {
-                AnsiConsole.WriteLine($"[DEBUG] TOML config file not found, using default configuration");
+                WriteDiagnostic("TOML config file not found, using default configuration");
                 // Create default configuration if file doesn't exist
-                CreateDefaultConfiguration();
+                CreateDefaultConfiguration(configDirectory);
                 return;
             }
             
-            AnsiConsole.WriteLine($"[DEBUG] Loading TOML configuration from: {configPath}");
+            WriteDiagnostic($"Loading TOML configuration from: {resolvedConfigPath}");
 
-            var tomlContent = File.ReadAllText(configPath);
+            var tomlContent = File.ReadAllText(resolvedConfigPath);
             var model = Toml.ToModel(tomlContent);
             
-            var config = CreateNLogConfigurationFromToml(model);
+            var config = CreateNLogConfigurationFromToml(model, configDirectory);
             
             // Create log directories (TOML config doesn't do this automatically)
-            AnsiConsole.WriteLine($"[DEBUG] Creating log directories for TOML config...");
-            CreateLogDirectories();
+            WriteDiagnostic("Creating log directories for TOML config...");
+            CreateLogDirectories(logDirectory, archiveDirectory);
+
+            NLog.Common.InternalLogger.LogFile = Path.Combine(logDirectory, "nlog-internal.log");
             
             LogManager.Configuration = config;
             
             // Debug: Check if targets were created
-            AnsiConsole.WriteLine($"[DEBUG] Configured targets: {string.Join(", ", config.AllTargets.Select(t => t.Name))}");
-            AnsiConsole.WriteLine($"[DEBUG] Configured rules: {config.LoggingRules.Count}");
+            WriteDiagnostic($"Configured targets: {string.Join(", ", config.AllTargets.Select(t => t.Name))}");
+            WriteDiagnostic($"Configured rules: {config.LoggingRules.Count}");
         
         var logger = LogManager.GetCurrentClassLogger();
-        logger.Info("NLog configuration loaded successfully from TOML file: {ConfigPath}", configPath);
+        logger.Info("NLog configuration loaded successfully from TOML file: {ConfigPath}", resolvedConfigPath);
         
         // Test file logging immediately
-        AnsiConsole.WriteLine($"[DEBUG] Testing file logging...");
+        WriteDiagnostic("Testing file logging...");
         logger.Info("TOML FILE LOGGING TEST - This should appear in log files");
         logger.Error("TOML ERROR LOGGING TEST - This should appear in log files");
         
         // Force flush to ensure files are written
-        AnsiConsole.WriteLine($"[DEBUG] Flushing log files...");
+        WriteDiagnostic("Flushing log files...");
         LogManager.Flush();
         
         // Debug: Check if files were created
-        var logDir = Path.GetFullPath("logs");
-        var logFiles = Directory.GetFiles(logDir, "*.log", SearchOption.AllDirectories);
-        AnsiConsole.WriteLine($"[DEBUG] Log files found: {logFiles.Length}");
+        var logFiles = Directory.GetFiles(logDirectory, "*.log", SearchOption.AllDirectories);
+        WriteDiagnostic($"Log files found: {logFiles.Length}");
         foreach (var file in logFiles)
         {
-            AnsiConsole.WriteLine($"[DEBUG] - {file} ({new FileInfo(file).Length} bytes)");
+            WriteDiagnostic($"- {file} ({new FileInfo(file).Length} bytes)");
         }
         }
         catch (Exception ex)
         {
-            AnsiConsole.WriteLine($"[DEBUG] Error loading TOML config: {ex.Message}");
+            WriteDiagnostic($"Error loading TOML config: {ex.Message}");
             // Fallback to default configuration if TOML parsing fails
-            CreateDefaultConfiguration();
+            var fallbackDirectory = Path.GetDirectoryName(ResolveConfigurationPath(configPath)) ?? AppDomain.CurrentDomain.BaseDirectory;
+            CreateDefaultConfiguration(fallbackDirectory);
             var logger = LogManager.GetCurrentClassLogger();
             logger.Error(ex, "Failed to load TOML configuration from {ConfigPath}, using default configuration", configPath);
         }
@@ -85,7 +92,7 @@ public static class LoggingConfiguration
     /// </summary>
     /// <param name="model">The parsed TOML model.</param>
     /// <returns>NLog configuration.</returns>
-    private static NLog.Config.LoggingConfiguration CreateNLogConfigurationFromToml(TomlTable model)
+    private static NLog.Config.LoggingConfiguration CreateNLogConfigurationFromToml(TomlTable model, string configDirectory)
     {
         var config = new NLog.Config.LoggingConfiguration();
         var ruleTables = new List<TomlTable>();
@@ -99,7 +106,12 @@ public static class LoggingConfiguration
                 {
                     if (variable.Value is string variableValue)
                     {
-                        config.Variables[variable.Key] = variableValue;
+                        config.Variables[variable.Key] = variable.Key switch
+                        {
+                            "logDirectory" => GetAbsolutePath(configDirectory, variableValue),
+                            "archiveDirectory" => GetAbsolutePath(configDirectory, variableValue),
+                            _ => variableValue
+                        };
                     }
                 }
             }
@@ -156,11 +168,11 @@ public static class LoggingConfiguration
         if (!targetTable.TryGetValue("name", out var nameValue) || nameValue is not string name ||
             !targetTable.TryGetValue("type", out var typeValue) || typeValue is not string type)
         {
-            AnsiConsole.WriteLine($"[DEBUG] Invalid target table - missing name or type");
+            WriteDiagnostic("Invalid target table - missing name or type");
             return null;
         }
 
-        AnsiConsole.WriteLine($"[DEBUG] Creating target: {name} of type {type}");
+        WriteDiagnostic($"Creating target: {name} of type {type}");
 
         Target target = type.ToLowerInvariant() switch
         {
@@ -178,7 +190,7 @@ public static class LoggingConfiguration
             if (property.Key is "name" or "type")
                 continue;
 
-            AnsiConsole.WriteLine($"[DEBUG] Setting property {property.Key} = {property.Value}");
+            WriteDiagnostic($"Setting property {property.Key} = {property.Value}");
             
             if (property.Value is string stringValue)
             {
@@ -194,7 +206,7 @@ public static class LoggingConfiguration
             }
         }
 
-        AnsiConsole.WriteLine($"[DEBUG] Target {name} created successfully");
+        WriteDiagnostic($"Target {name} created successfully");
         return target;
     }
 
@@ -278,16 +290,16 @@ public static class LoggingConfiguration
                 }
                 
                 property.SetValue(target, convertedValue);
-                AnsiConsole.WriteLine($"[DEBUG] Successfully set {propertyName} = {propertyValue} on {target.Name}");
+                WriteDiagnostic($"Successfully set {propertyName} = {propertyValue} on {target.Name}");
             }
             catch (Exception ex)
             {
-                AnsiConsole.WriteLine($"[DEBUG] Failed to set {propertyName} = {propertyValue} on {target.Name}: {ex.Message}");
+                WriteDiagnostic($"Failed to set {propertyName} = {propertyValue} on {target.Name}: {ex.Message}");
             }
         }
         else
         {
-            AnsiConsole.WriteLine($"[DEBUG] Property {propertyName} not found or not writable on {target.GetType().Name}");
+            WriteDiagnostic($"Property {propertyName} not found or not writable on {target.GetType().Name}");
         }
     }
 
@@ -317,43 +329,47 @@ stack_trace = ""${exception:format=tostring}""}
     /// <summary>
     /// Creates the log directory needed for file logging.
     /// </summary>
-    private static void CreateLogDirectories()
+    private static void CreateLogDirectories(string logDirectory, string archiveDirectory)
     {
         try
         {
-            Directory.CreateDirectory("logs");
-            Directory.CreateDirectory("logs/archive");
-            AnsiConsole.WriteLine($"[DEBUG] Log directories created successfully");
+            Directory.CreateDirectory(logDirectory);
+            Directory.CreateDirectory(archiveDirectory);
+            WriteDiagnostic("Log directories created successfully");
         }
         catch (Exception ex)
         {
-            AnsiConsole.WriteLine($"[DEBUG] Error creating log directories: {ex.Message}");
+            WriteDiagnostic($"Error creating log directories: {ex.Message}");
         }
     }
     
     /// <summary>
     /// Creates a default NLog configuration when TOML file is not available.
     /// </summary>
-    private static void CreateDefaultConfiguration()
+    private static void CreateDefaultConfiguration(string baseDirectory)
     {
-        AnsiConsole.WriteLine($"[DEBUG] Creating default NLog configuration");
+        WriteDiagnostic("Creating default NLog configuration");
         
         // Register our custom TOML target with modern NLog API
         LogManager.Setup().SetupExtensions(s => s.RegisterTarget<TomlFileTarget>("TomlFile"));
         
         var config = new NLog.Config.LoggingConfiguration();
+        var logDirectory = Path.Combine(baseDirectory, "logs");
+        var archiveDirectory = Path.Combine(logDirectory, "archive");
 
         // Create directories
-        AnsiConsole.WriteLine($"[DEBUG] Creating log directories");
-        CreateLogDirectories();
-        AnsiConsole.WriteLine($"[DEBUG] Log directories created at: {Path.GetFullPath("logs")}");
+        WriteDiagnostic("Creating log directories");
+        CreateLogDirectories(logDirectory, archiveDirectory);
+        WriteDiagnostic($"Log directories created at: {logDirectory}");
+
+        NLog.Common.InternalLogger.LogFile = Path.Combine(logDirectory, "nlog-internal.log");
 
         // Main structured log file
         var fileTarget = new FileTarget("fileTarget")
         {
-            FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.log",
+            FileName = Path.Combine(logDirectory, "autodesk-cleaner-${date:format=yyyy-MM-dd}.log"),
             Layout = "${longdate} [${level:uppercase=true}] ${logger} | ${message} | thread=${threadid} user=${environment-user} machine=${machinename} ${exception:format=tostring}",
-            ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.log",
+            ArchiveFileName = Path.Combine(archiveDirectory, "autodesk-cleaner-{#}.log"),
             ArchiveEvery = FileArchivePeriod.Day,
             MaxArchiveFiles = 30,
             KeepFileOpen = false,
@@ -363,9 +379,9 @@ stack_trace = ""${exception:format=tostring}""}
         // JSON structured log file
         var jsonTarget = new FileTarget("jsonTarget")
         {
-            FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.json",
+            FileName = Path.Combine(logDirectory, "autodesk-cleaner-${date:format=yyyy-MM-dd}.json"),
             Layout = "${json-encode}",
-            ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.json",
+            ArchiveFileName = Path.Combine(archiveDirectory, "autodesk-cleaner-{#}.json"),
             ArchiveEvery = FileArchivePeriod.Day,
             MaxArchiveFiles = 30,
             KeepFileOpen = false,
@@ -376,8 +392,8 @@ stack_trace = ""${exception:format=tostring}""}
         var tomlTarget = new TomlFileTarget
         {
             Name = "tomlTarget",
-            FileName = "logs/autodesk-cleaner-${date:format=yyyy-MM-dd}.toml",
-            ArchiveFileName = "logs/archive/autodesk-cleaner-{#}.toml",
+            FileName = Path.Combine(logDirectory, "autodesk-cleaner-${date:format=yyyy-MM-dd}.toml"),
+            ArchiveFileName = Path.Combine(archiveDirectory, "autodesk-cleaner-{#}.toml"),
             ArchiveEvery = FileArchivePeriod.Day,
             MaxArchiveFiles = 30,
             KeepFileOpen = false,
@@ -427,34 +443,70 @@ stack_trace = ""${exception:format=tostring}""}
         LogManager.Configuration = config;
         
         // Test file logging immediately
-        AnsiConsole.WriteLine($"[DEBUG] Testing default file logging...");
+        WriteDiagnostic("Testing default file logging...");
         var logger = LogManager.GetCurrentClassLogger();
         logger.Info("DEFAULT FILE LOGGING TEST - This should appear in log files");
         logger.Error("DEFAULT ERROR LOGGING TEST - This should appear in log files");
         
         // Force flush to ensure files are written
-        AnsiConsole.WriteLine($"[DEBUG] Flushing default log files...");
+        WriteDiagnostic("Flushing default log files...");
         LogManager.Flush();
         
         // Debug: Check if files were created
-        var logDir = Path.GetFullPath("logs");
-        var logFiles = Directory.GetFiles(logDir, "*.log", SearchOption.AllDirectories);
-        AnsiConsole.WriteLine($"[DEBUG] Default log files found: {logFiles.Length}");
+        var logFiles = Directory.GetFiles(logDirectory, "*.log", SearchOption.AllDirectories);
+        WriteDiagnostic($"Default log files found: {logFiles.Length}");
         foreach (var file in logFiles)
         {
-            AnsiConsole.WriteLine($"[DEBUG] - {file} ({new FileInfo(file).Length} bytes)");
+            WriteDiagnostic($"- {file} ({new FileInfo(file).Length} bytes)");
         }
         
         // Force a manual file write test
         try
         {
-            var testFile = "logs/manual-test.txt";
+            var testFile = Path.Combine(logDirectory, "manual-test.txt");
             File.WriteAllText(testFile, $"Manual file write test at {DateTime.Now}");
-            AnsiConsole.WriteLine($"[DEBUG] Manual file write successful: {Path.GetFullPath(testFile)}");
+            WriteDiagnostic($"Manual file write successful: {testFile}");
         }
         catch (Exception ex)
         {
-            AnsiConsole.WriteLine($"[DEBUG] Manual file write failed: {ex.Message}");
+            WriteDiagnostic($"Manual file write failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Resolves the logging configuration path from the current directory or application directory.
+    /// </summary>
+    private static string ResolveConfigurationPath(string configPath)
+    {
+        if (Path.IsPathRooted(configPath))
+        {
+            return configPath;
+        }
+
+        var candidates = new[]
+        {
+            Path.Combine(Environment.CurrentDirectory, configPath),
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, configPath)
+        };
+
+        return candidates.FirstOrDefault(File.Exists) ?? candidates[0];
+    }
+
+    /// <summary>
+    /// Resolves a relative path against the configuration directory.
+    /// </summary>
+    private static string GetAbsolutePath(string baseDirectory, string path)
+    {
+        return Path.IsPathRooted(path)
+            ? path
+            : Path.GetFullPath(Path.Combine(baseDirectory, path));
+    }
+
+    /// <summary>
+    /// Writes bootstrap diagnostics only when explicitly enabled during development.
+    /// </summary>
+    private static void WriteDiagnostic(string message)
+    {
+        _ = message;
     }
 }

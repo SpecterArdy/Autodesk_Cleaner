@@ -24,6 +24,9 @@ A modular, high-integrity tool for completely removing all Autodesk products fro
 - **Selective Cleaning**: Choose user-only or system-only cleanup
 - **Progress Reporting**: Detailed status and error reporting
 - **Administrator Validation**: Requires proper privileges for system modifications
+- **Installer Media Cleanup**: Targets Autodesk installer caches, including 2027 media extracted to `C:\Autodesk\WI`
+- **Ownership Recovery**: Uses administrative ownership and ACL repair when Autodesk files are locked or access is denied
+- **Licensing Repair**: Includes a dedicated repair path for stale 3ds Max 2027 network-license overrides on named-user installs
 
 ## Autodesk Products Supported
 
@@ -102,6 +105,7 @@ Autodesk_Cleaner.exe --dry-run --user-only
 - Autodesk-related installer entries
 
 ### Files and Directories
+- `C:\Autodesk` and extracted installer media such as `C:\Autodesk\WI`
 - `C:\Program Files\Autodesk`
 - `C:\Program Files\Common Files\Autodesk Shared`
 - `C:\Program Files (x86)\Autodesk`
@@ -126,6 +130,7 @@ Autodesk_Cleaner.exe --dry-run --user-only
 - Autodesk-only pattern matching
 - File existence checks before removal
 - Read-only attribute handling
+- Ownership and ACL recovery for locked Autodesk files and directories
 
 ### Error Handling
 - Comprehensive error reporting

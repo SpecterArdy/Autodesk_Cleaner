@@ -47,6 +47,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     /// Autodesk file system paths to scan and clean.
     /// </summary>
     private static readonly IReadOnlyList<string> AutodeskPaths = [
+        @"C:\Autodesk",
         @"C:\Program Files\Autodesk",
         @"C:\Program Files\Common Files\Autodesk Shared",
         @"C:\Program Files (x86)\Autodesk",
@@ -65,6 +66,16 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     ];
 
     /// <summary>
+    /// Known Autodesk installer and deployment cache paths, including 2027 media extracted by modern installers.
+    /// </summary>
+    private static readonly IReadOnlyList<string> AutodeskInstallMediaPaths = [
+        @"C:\Autodesk\WI",
+        @"C:\ProgramData\Autodesk\ODIS",
+        @"C:\Program Files\Autodesk\AdODIS",
+        @"C:\Program Files (x86)\Autodesk\AdODIS"
+    ];
+
+    /// <summary>
     /// Temp directory paths to clean.
     /// </summary>
     private static readonly IReadOnlyList<string> TempPaths = [
@@ -76,7 +87,14 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     /// Patterns to match Autodesk-related files and directories.
     /// </summary>
     private static readonly Regex AutodeskPattern = new(
-        @"(autodesk|maya|3ds\s*max|autocad|revit|inventor|fusion|vault|navisworks|mudbox|motionbuilder|alias|adsk)",
+        @"(autodesk|maya|3ds\s*max|autocad|revit|inventor|fusion|vault|navisworks|mudbox|motionbuilder|alias|adsk|autodesk\s*access|adskaccess|odis|adodis)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Patterns that identify Autodesk 2027 installer artifacts even when the file name is generic.
+    /// </summary>
+    private static readonly Regex Autodesk2027InstallPattern = new(
+        @"(?<!\d)(2027|R27)(?!\d)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>
@@ -85,6 +103,17 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     private static readonly Regex FlexNetPattern = new(
         @"^adsk.*",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Enumeration settings used when clearing attributes or force-deleting directory trees.
+    /// </summary>
+    private static readonly System.IO.EnumerationOptions RecursiveEnumerationOptions = new()
+    {
+        RecurseSubdirectories = true,
+        IgnoreInaccessible = true,
+        AttributesToSkip = 0,
+        ReturnSpecialDirectories = false
+    };
 
     /// <summary>
     /// Initializes a new instance of the AutodeskFileSystemCleaner.
@@ -155,8 +184,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     {
         // Filter to only valid entries
         var validEntries = FilterValidEntries(entries);
+        var removalPlan = BuildRemovalPlan(validEntries);
         
-        if (validEntries.Count == 0)
+        if (removalPlan.Count == 0)
         {
             Logger.Error("File system entry validation failed - no valid entries found to process");
             return new RemovalResult(
@@ -167,7 +197,8 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                 Duration: TimeSpan.Zero);
         }
         
-        Logger.Info("Processing {ValidCount} valid entries out of {TotalCount} total entries", validEntries.Count, entries.Count);
+        Logger.Info("Processing {RemovalPlanCount} planned file system removals from {ValidCount} valid entries out of {TotalCount} total entries",
+            removalPlan.Count, validEntries.Count, entries.Count);
 
         var stopwatch = Stopwatch.StartNew();
         var errors = new List<string>();
@@ -199,7 +230,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         await KillAllAutodeskProcessesAsync();
         
         // Process each valid entry
-        if (!validEntries.Any())
+        if (!removalPlan.Any())
         {
             Logger.Warn("No valid file system entries to process.");
             return new RemovalResult(
@@ -213,12 +244,12 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
 
         // Progress reporting setup
         var processedCount = 0;
-        var totalCount = validEntries.Count;
+        var totalCount = removalPlan.Count;
         var progressReportInterval = Math.Max(1, totalCount / 100); // Report every 1% or at least every entry
         
         Logger.Info("Starting removal of {TotalCount} file system entries", totalCount);
         
-        foreach (var entry in validEntries)
+        foreach (var entry in removalPlan)
         {
             try
             {
@@ -282,9 +313,9 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         stopwatch.Stop();
 
         return new RemovalResult(
-            TotalEntries: validEntries.Count,
+            TotalEntries: removalPlan.Count,
             SuccessfulRemovals: successfulRemovals,
-            FailedRemovals: validEntries.Count - successfulRemovals,
+            FailedRemovals: removalPlan.Count - successfulRemovals,
             Errors: errors,
             Duration: stopwatch.Elapsed);
     }
@@ -349,12 +380,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         
         foreach (var entry in entries)
         {
-            var isAutodeskPath = IsAutodeskPath(entry.Path);
-            var matchesPath = AutodeskPattern.IsMatch(entry.Path);
-            var matchesFileName = AutodeskPattern.IsMatch(Path.GetFileName(entry.Path));
-            var matchesFlexNet = FlexNetPattern.IsMatch(Path.GetFileName(entry.Path));
-            
-            var isValid = isAutodeskPath || matchesPath || matchesFileName || matchesFlexNet;
+            var isValid = MatchesAutodeskTarget(entry.Path);
             
             if (isValid)
             {
@@ -363,8 +389,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             else
             {
                 invalidEntries.Add(entry);
-                Logger.Debug("Invalid entry: {Path}, AutodeskPath: {IsAutodeskPath}, PathMatch: {MatchesPath}, FileNameMatch: {MatchesFileName}, FlexNetMatch: {MatchesFlexNet}", 
-                    entry.Path, isAutodeskPath, matchesPath, matchesFileName, matchesFlexNet);
+                Logger.Debug("Invalid entry: {Path}", entry.Path);
             }
         }
         
@@ -426,12 +451,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
         
         foreach (var entry in entries)
         {
-            var isAutodeskPath = IsAutodeskPath(entry.Path);
-            var matchesPath = AutodeskPattern.IsMatch(entry.Path);
-            var matchesFileName = AutodeskPattern.IsMatch(Path.GetFileName(entry.Path));
-            var matchesFlexNet = FlexNetPattern.IsMatch(Path.GetFileName(entry.Path));
-            
-            var isValid = isAutodeskPath || matchesPath || matchesFileName || matchesFlexNet;
+            var isValid = MatchesAutodeskTarget(entry.Path);
             
             if (isValid)
             {
@@ -442,14 +462,50 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                 invalidCount++;
                 if (invalidCount <= 3) // Log first 3 invalid entries for debugging
                 {
-                    Logger.Debug("FilterValidEntries: Invalid file entry {Path} - AutodeskPath: {IsAutodeskPath}, PathMatch: {MatchesPath}, FileNameMatch: {MatchesFileName}, FlexNetMatch: {MatchesFlexNet}", 
-                        entry.Path, isAutodeskPath, matchesPath, matchesFileName, matchesFlexNet);
+                    Logger.Debug("FilterValidEntries: Invalid file entry {Path}", entry.Path);
                 }
             }
         }
         
         Logger.Info("FilterValidEntries: Found {ValidCount} valid file system entries, {InvalidCount} invalid entries", validEntries.Count, invalidCount);
         return validEntries;
+    }
+
+    /// <summary>
+    /// Collapses nested file and directory entries into the smallest safe set of removals.
+    /// Prefers deleting a parent directory recursively instead of deleting its children one by one.
+    /// </summary>
+    /// <param name="entries">The validated file system entries.</param>
+    /// <returns>The optimized removal plan.</returns>
+    private static List<FileSystemEntry> BuildRemovalPlan(IReadOnlyCollection<FileSystemEntry> entries)
+    {
+        if (entries.Count == 0)
+        {
+            return [];
+        }
+
+        var orderedEntries = entries
+            .Select(entry => (Entry: entry, FullPath: NormalizeFullPath(entry.Path)))
+            .OrderBy(item => item.Entry.EntryType == FileSystemEntryType.Directory ? 0 : 1)
+            .ThenBy(item => item.FullPath.Length)
+            .ThenBy(item => item.FullPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var plannedEntries = new List<(FileSystemEntry Entry, string FullPath)>();
+
+        foreach (var candidate in orderedEntries)
+        {
+            var isCoveredByPlannedDirectory = plannedEntries.Any(planned =>
+                planned.Entry.EntryType == FileSystemEntryType.Directory &&
+                IsDescendantPath(candidate.FullPath, planned.FullPath));
+
+            if (!isCoveredByPlannedDirectory)
+            {
+                plannedEntries.Add(candidate);
+            }
+        }
+
+        return plannedEntries.Select(item => item.Entry).ToList();
     }
 
     /// <summary>
@@ -469,6 +525,12 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             return true;
         }
 
+        if (AutodeskInstallMediaPaths.Any(basePath =>
+            path.StartsWith(basePath, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
         // Check if path is under any user-specific Autodesk paths
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return UserAutodeskPaths.Any(relativePath => 
@@ -476,6 +538,88 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             var fullPath = Path.Combine(userProfile, relativePath);
             return path.StartsWith(fullPath, StringComparison.OrdinalIgnoreCase);
         });
+    }
+
+    /// <summary>
+    /// Determines whether a path targets Autodesk products, install media, or licensing artifacts.
+    /// </summary>
+    /// <param name="path">The path to evaluate.</param>
+    /// <returns>True if the path should be considered for cleanup.</returns>
+    private static bool MatchesAutodeskTarget(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var fileName = Path.GetFileName(path);
+        return IsAutodeskPath(path) ||
+               AutodeskPattern.IsMatch(path) ||
+               (!string.IsNullOrEmpty(fileName) && AutodeskPattern.IsMatch(fileName)) ||
+               (!string.IsNullOrEmpty(fileName) && FlexNetPattern.IsMatch(fileName)) ||
+               IsAutodeskInstallMediaPath(path);
+    }
+
+    /// <summary>
+    /// Detects Autodesk installer caches and extracted 2027 media.
+    /// </summary>
+    /// <param name="path">The path to evaluate.</param>
+    /// <returns>True if the path looks like Autodesk installer media.</returns>
+    private static bool IsAutodeskInstallMediaPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var normalizedPath = path.Replace('/', '\\');
+        if (AutodeskInstallMediaPaths.Any(basePath =>
+            normalizedPath.StartsWith(basePath, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (!Autodesk2027InstallPattern.IsMatch(normalizedPath))
+        {
+            return false;
+        }
+
+        return normalizedPath.Contains(@"\Autodesk\", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains(@"\ODIS\", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains(@"\AdODIS\", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains("setup.exe", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains("installer.exe", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains("bundlemanifest.xml", StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.Contains("collection.xml", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Normalizes a path to a comparable full-path form.
+    /// </summary>
+    /// <param name="path">The path to normalize.</param>
+    /// <returns>The normalized full path.</returns>
+    private static string NormalizeFullPath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        return fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// Determines whether a candidate path is equal to or nested under a parent directory path.
+    /// </summary>
+    /// <param name="candidatePath">The candidate path.</param>
+    /// <param name="directoryPath">The parent directory path.</param>
+    /// <returns>True when the candidate is covered by the parent directory deletion.</returns>
+    private static bool IsDescendantPath(string candidatePath, string directoryPath)
+    {
+        if (candidatePath.Equals(directoryPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return candidatePath.StartsWith(
+            directoryPath + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -495,7 +639,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             var attributes = directoryInfo.Attributes;
 
             // Add the directory itself if it's Autodesk-related
-            if (AutodeskPattern.IsMatch(directoryPath))
+            if (MatchesAutodeskTarget(directoryPath))
             {
                 _foundEntries.Add(new FileSystemEntry(
                     Path: directoryPath,
@@ -511,8 +655,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 try
                 {
-                    if (AutodeskPattern.IsMatch(file.FullName) || 
-                        AutodeskPattern.IsMatch(file.Name))
+                    if (MatchesAutodeskTarget(file.FullName))
                     {
                         _foundEntries.Add(new FileSystemEntry(
                             Path: file.FullName,
@@ -534,8 +677,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
             {
                 try
                 {
-                    if (AutodeskPattern.IsMatch(subDirectory.FullName) || 
-                        AutodeskPattern.IsMatch(subDirectory.Name))
+                    if (MatchesAutodeskTarget(subDirectory.FullName))
                     {
                         _foundEntries.Add(new FileSystemEntry(
                             Path: subDirectory.FullName,
@@ -577,7 +719,7 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
                 var tempDir = new DirectoryInfo(tempPath);
                 foreach (var item in tempDir.GetFileSystemInfos("*", SearchOption.TopDirectoryOnly))
                 {
-                    if (AutodeskPattern.IsMatch(item.Name))
+                    if (MatchesAutodeskTarget(item.FullName))
                     {
                         if (item is FileInfo file)
                         {
@@ -1263,50 +1405,60 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     }
 
     /// <summary>
-    /// Attempts to remove a file, retrying if necessary.
-    /// <summary>
+    /// Attempts to remove a file, recovering ownership and ACLs if access is blocked.
+    /// </summary>
     private async Task<bool> RemoveFileAsync(string filePath, bool isReadOnly)
     {
         try
         {
-            // Remove read-only attribute if present
-            if (isReadOnly && File.Exists(filePath))
+            if (!File.Exists(filePath))
             {
-                File.SetAttributes(filePath, File.GetAttributes(filePath) & ~FileAttributes.ReadOnly);
+                return true;
             }
 
+            ClearReadOnlyAttribute(filePath, isReadOnly);
             File.Delete(filePath);
             return true;
         }
-        catch(IOException ex) when (ex.Message.Contains("being used by another process") || 
-                                    ex.Message.Contains("access is denied"))
+        catch (Exception ex) when (IsAccessOrLockException(ex))
         {
-            Logger.Debug("File {Path} is in use, attempting to kill processes using it", filePath);
-
-            // Kill processes using the file
-            await KillProcessesUsingFileAsync(filePath);
-
-            // Try again after killing processes
-            try
-            {
-                if (isReadOnly && File.Exists(filePath))
-                {
-                    File.SetAttributes(filePath, File.GetAttributes(filePath) & ~FileAttributes.ReadOnly);
-                }
-                File.Delete(filePath);
-                return true;
-            }
-            catch
-            {
-                // Emergency fallback to WMI deletion
-                Logger.Debug("Attempting WMI file deletion for {Path}", filePath);
-                return await DeleteFileWmiAsync(filePath);
-            }
+            Logger.Warn(ex, "Recovering locked or inaccessible file before deletion: {Path}", filePath);
+            return await RecoverAndDeleteFileAsync(filePath, isReadOnly);
         }
         catch (Exception ex)
         {
             Logger.Error(ex, "Error removing file {Path}: {Message}", filePath, ex.Message);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Performs lock recovery, ownership takeover, and ACL repair before deleting a file.
+    /// </summary>
+    /// <param name="filePath">The file to remove.</param>
+    /// <param name="isReadOnly">Whether the file was originally marked read-only.</param>
+    /// <returns>True if the file was removed successfully.</returns>
+    private async Task<bool> RecoverAndDeleteFileAsync(string filePath, bool isReadOnly)
+    {
+        await KillProcessesUsingFileAsync(filePath);
+        await TakeOwnershipAndGrantFullControlAsync(filePath, isDirectory: false);
+
+        try
+        {
+            if (!File.Exists(filePath))
+            {
+                return true;
+            }
+
+            ClearReadOnlyAttribute(filePath, isReadOnly);
+            File.Delete(filePath);
+            return true;
+        }
+        catch (Exception retryEx)
+        {
+            Logger.Debug(retryEx, "File delete retry failed after ownership recovery for {Path}", filePath);
+            Logger.Debug("Attempting WMI file deletion for {Path}", filePath);
+            return await DeleteFileWmiAsync(filePath);
         }
     }
 
@@ -1360,8 +1512,8 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
     }
 
     /// <summary>
-    /// Attempts to remove a directory, retrying if necessary, using forced deletion.
-    /// <summary>
+    /// Attempts to remove a directory, recovering ownership and ACLs when required.
+    /// </summary>
     private async Task<bool> RemoveDirectoryAsync(string directoryPath)
     {
         if (!Directory.Exists(directoryPath))
@@ -1371,26 +1523,248 @@ public sealed class AutodeskFileSystemCleaner : IFileSystemCleaner, IDisposable
 
         try
         {
-            // Remove read-only attributes from all files in the directory
-            var directoryInfo = new DirectoryInfo(directoryPath);
-            foreach (var file in directoryInfo.GetFiles("*", SearchOption.AllDirectories))
-            {
-                if (file.IsReadOnly)
-                {
-                    file.Attributes &= ~FileAttributes.ReadOnly;
-                }
-            }
-
+            ClearDirectoryAttributes(directoryPath);
             Directory.Delete(directoryPath, true);
             return true;
         }
-        catch (IOException)
+        catch (Exception ex) when (IsAccessOrLockException(ex))
         {
-            Logger.Debug("Retrying directory deletion for {Path}", directoryPath);
-            
-            // If retry fails, try WMI approach
-            return await DeleteFileWmiAsync(directoryPath);
+            Logger.Warn(ex, "Recovering locked or inaccessible directory before deletion: {Path}", directoryPath);
+            await KillAllAutodeskProcessesAsync();
+            await TakeOwnershipAndGrantFullControlAsync(directoryPath, isDirectory: true);
+            ClearDirectoryAttributes(directoryPath);
+
+            try
+            {
+                await ForceDeleteDirectoryContentsAsync(directoryPath);
+                return !Directory.Exists(directoryPath);
+            }
+            catch (Exception retryEx)
+            {
+                Logger.Error(retryEx, "Directory delete retry failed after ownership recovery for {Path}", directoryPath);
+                return false;
+            }
         }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Error removing directory {Path}: {Message}", directoryPath, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Clears the read-only bit from a file when present.
+    /// </summary>
+    /// <param name="filePath">The file path.</param>
+    /// <param name="wasReadOnly">Whether the file was reported as read-only.</param>
+    private static void ClearReadOnlyAttribute(string filePath, bool wasReadOnly)
+    {
+        if (!File.Exists(filePath))
+        {
+            return;
+        }
+
+        var attributes = File.GetAttributes(filePath);
+        if (wasReadOnly || attributes.HasFlag(FileAttributes.ReadOnly))
+        {
+            File.SetAttributes(filePath, attributes & ~FileAttributes.ReadOnly);
+        }
+    }
+
+    /// <summary>
+    /// Clears restrictive attributes from all files and directories within a directory tree.
+    /// </summary>
+    /// <param name="directoryPath">The directory path.</param>
+    private static void ClearDirectoryAttributes(string directoryPath)
+    {
+        if (!Directory.Exists(directoryPath))
+        {
+            return;
+        }
+
+        foreach (var filePath in Directory.EnumerateFiles(directoryPath, "*", RecursiveEnumerationOptions))
+        {
+            try
+            {
+                ClearReadOnlyAttribute(filePath, wasReadOnly: false);
+            }
+            catch
+            {
+                // Best effort before ownership recovery.
+            }
+        }
+
+        foreach (var subDirectoryPath in Directory.EnumerateDirectories(directoryPath, "*", RecursiveEnumerationOptions))
+        {
+            try
+            {
+                var attributes = File.GetAttributes(subDirectoryPath);
+                if (attributes.HasFlag(FileAttributes.ReadOnly))
+                {
+                    File.SetAttributes(subDirectoryPath, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+            catch
+            {
+                // Best effort before ownership recovery.
+            }
+        }
+
+        try
+        {
+            var rootAttributes = File.GetAttributes(directoryPath);
+            if (rootAttributes.HasFlag(FileAttributes.ReadOnly))
+            {
+                File.SetAttributes(directoryPath, rootAttributes & ~FileAttributes.ReadOnly);
+            }
+        }
+        catch
+        {
+            // Best effort before ownership recovery.
+        }
+    }
+
+    /// <summary>
+    /// Performs a depth-first delete of a directory after ownership/ACL recovery.
+    /// </summary>
+    /// <param name="directoryPath">The directory to remove.</param>
+    private async Task ForceDeleteDirectoryContentsAsync(string directoryPath)
+    {
+        foreach (var filePath in Directory.EnumerateFiles(directoryPath, "*", RecursiveEnumerationOptions))
+        {
+            var isReadOnly = false;
+            try
+            {
+                isReadOnly = File.GetAttributes(filePath).HasFlag(FileAttributes.ReadOnly);
+            }
+            catch
+            {
+                // Best effort only.
+            }
+
+            await RemoveFileAsync(filePath, isReadOnly);
+        }
+
+        var subDirectories = Directory
+            .EnumerateDirectories(directoryPath, "*", RecursiveEnumerationOptions)
+            .OrderByDescending(static path => path.Length)
+            .ToList();
+
+        foreach (var subDirectoryPath in subDirectories)
+        {
+            try
+            {
+                var attributes = File.GetAttributes(subDirectoryPath);
+                if (attributes.HasFlag(FileAttributes.ReadOnly))
+                {
+                    File.SetAttributes(subDirectoryPath, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+            catch
+            {
+                // Best effort only.
+            }
+
+            if (Directory.Exists(subDirectoryPath))
+            {
+                Directory.Delete(subDirectoryPath, false);
+            }
+        }
+
+        if (Directory.Exists(directoryPath))
+        {
+            Directory.Delete(directoryPath, false);
+        }
+    }
+
+    /// <summary>
+    /// Attempts to take ownership and grant the local Administrators group full control.
+    /// </summary>
+    /// <param name="path">The file or directory path.</param>
+    /// <param name="isDirectory">Whether the path is a directory.</param>
+    private async Task TakeOwnershipAndGrantFullControlAsync(string path, bool isDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        var takeOwnArguments = isDirectory
+            ? $"/F \"{path}\" /A /R /D Y"
+            : $"/F \"{path}\" /A";
+        var icaclsArguments = isDirectory
+            ? $"\"{path}\" /grant *S-1-5-32-544:(OI)(CI)F /T /C /Q"
+            : $"\"{path}\" /grant *S-1-5-32-544:F /C /Q";
+
+        await RunUtilityAsync("takeown.exe", takeOwnArguments, path);
+        await RunUtilityAsync("icacls.exe", icaclsArguments, path);
+    }
+
+    /// <summary>
+    /// Runs a Windows utility used during delete recovery.
+    /// </summary>
+    /// <param name="fileName">The utility name.</param>
+    /// <param name="arguments">Command-line arguments.</param>
+    /// <param name="targetPath">The path being processed.</param>
+    private async Task RunUtilityAsync(string fileName, string arguments, string targetPath)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                Logger.Warn("Failed to start utility {Utility} for {Path}", fileName, targetPath);
+                return;
+            }
+
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+            {
+                var errorOutput = await process.StandardError.ReadToEndAsync();
+                Logger.Debug("Utility {Utility} exited with code {ExitCode} for {Path}: {ErrorOutput}",
+                    fileName, process.ExitCode, targetPath, errorOutput.Trim());
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Utility {Utility} failed for {Path}: {Message}", fileName, targetPath, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Determines whether an exception indicates a lock or access-control problem.
+    /// </summary>
+    /// <param name="ex">The exception to evaluate.</param>
+    /// <returns>True if the exception should trigger ownership recovery.</returns>
+    private static bool IsAccessOrLockException(Exception ex)
+    {
+        if (ex is UnauthorizedAccessException)
+        {
+            return true;
+        }
+
+        if (ex is not IOException ioException)
+        {
+            return false;
+        }
+
+        return ioException.HResult == unchecked((int)0x80070005) ||
+               ioException.HResult == unchecked((int)0x80070020) ||
+               ioException.HResult == unchecked((int)0x80070021) ||
+               ioException.Message.Contains("access is denied", StringComparison.OrdinalIgnoreCase) ||
+               ioException.Message.Contains("being used by another process", StringComparison.OrdinalIgnoreCase) ||
+               ioException.Message.Contains("cannot access the file", StringComparison.OrdinalIgnoreCase);
     }
     
 

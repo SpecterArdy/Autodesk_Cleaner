@@ -1,5 +1,8 @@
 using Autodesk_Cleaner.Core;
+using Microsoft.Win32;
+using System.Diagnostics;
 using System.Security.Principal;
+using System.ServiceProcess;
 using NLog;
 using Spectre.Console;
 
@@ -12,6 +15,11 @@ internal static class Program
 {
     private static Logger? _logger;
     private static ScannerConfig _currentConfig = ScannerConfig.Default;
+    private const string AdskNetworkLicenseServiceName = "AdskNLM";
+    private const string ThreeDsMax2027ProductKey = "128S1";
+    private const string ThreeDsMax2027ProductVersion = "2027.0.0.F";
+
+    private readonly record struct LicenseRepairStep(string Step, string Status, string Details);
 
     /// <summary>
     /// Main entry point for the application.
@@ -20,14 +28,6 @@ internal static class Program
     /// <returns>Exit code (0 for success, non-zero for error).</returns>
     private static async Task<int> Main(string[] args)
     {
-        // Check for debug mode
-        bool debugMode = args.Contains("--debug") || args.Contains("-d");
-        
-        if (debugMode)
-        {
-            return await RunDebugModeAsync();
-        }
-        
         try
         {
             // Initialize logging first
@@ -55,7 +55,7 @@ internal static class Program
                 
                 AnsiConsole.Write(errorPanel);
                 AnsiConsole.MarkupLine("\n[dim]Press any key to exit...[/]");
-                Console.ReadKey();
+                WaitForUserKeyIfInteractive();
                 return 1;
             }
             
@@ -104,7 +104,7 @@ internal static class Program
             }
             
             AnsiConsole.MarkupLine("\n[dim]Press any key to exit...[/]");
-            Console.ReadKey();
+            WaitForUserKeyIfInteractive();
             
             return -1;
         }
@@ -146,6 +146,9 @@ internal static class Program
                     break;
                 case InteractiveMenu.MenuOption.ViewConfiguration:
                     HandleViewConfiguration();
+                    break;
+                case InteractiveMenu.MenuOption.Repair3dsMax2027Licensing:
+                    await HandleRepair3dsMax2027LicensingAsync();
                     break;
                 case InteractiveMenu.MenuOption.EmergencyAbort:
                     _logger?.Warn("Emergency abort triggered by user");
@@ -384,6 +387,323 @@ internal static class Program
         };
         
         AnsiConsole.Write(panel);
+    }
+
+    /// <summary>
+    /// Repairs stale Autodesk network-license settings that can block 3ds Max 2027 named-user sign-in.
+    /// </summary>
+    private static async Task HandleRepair3dsMax2027LicensingAsync()
+    {
+        var repairSteps = await AnsiConsole.Status()
+            .StartAsync("[yellow]Repairing stale Autodesk licensing configuration...[/]", async ctx =>
+            {
+                ctx.Status("Running Autodesk licensing helper...");
+                var steps = new List<LicenseRepairStep>
+                {
+                    await Reset3dsMax2027NamedUserLicensingAsync()
+                };
+
+                ctx.Status("Clearing Autodesk licensing service cache...");
+                steps.Add(RemoveAdskLicensingServiceCache());
+
+                ctx.Status("Clearing FLEXlm network-license overrides...");
+                steps.Add(RemoveRegistryValueIfPresent(
+                    RegistryHive.CurrentUser,
+                    RegistryView.Default,
+                    @"Software\FLEXlm License Manager",
+                    "ADSKFLEX_LICENSE_FILE",
+                    @"HKCU\Software\FLEXlm License Manager\ADSKFLEX_LICENSE_FILE"));
+                steps.Add(RemoveRegistryValueIfPresent(
+                    RegistryHive.LocalMachine,
+                    RegistryView.Registry64,
+                    @"Software\FLEXlm License Manager",
+                    "ADSKFLEX_LICENSE_FILE",
+                    @"HKLM\Software\FLEXlm License Manager\ADSKFLEX_LICENSE_FILE"));
+                steps.Add(RemoveRegistryValueIfPresent(
+                    RegistryHive.LocalMachine,
+                    RegistryView.Registry32,
+                    @"Software\FLEXlm License Manager",
+                    "ADSKFLEX_LICENSE_FILE",
+                    @"HKLM\Software\Wow6432Node\FLEXlm License Manager\ADSKFLEX_LICENSE_FILE"));
+
+                ctx.Status("Updating Autodesk Network License Manager service...");
+                steps.Add(await SetServiceStartupManualAsync(AdskNetworkLicenseServiceName));
+
+                return steps;
+            });
+
+        DisplayLicenseRepairSummary(repairSteps);
+    }
+
+    /// <summary>
+    /// Runs Autodesk's licensing helper to switch 3ds Max 2027 back to named-user mode.
+    /// </summary>
+    private static async Task<LicenseRepairStep> Reset3dsMax2027NamedUserLicensingAsync()
+    {
+        var helperPath = GetAdskLicensingHelperPath();
+        if (!File.Exists(helperPath))
+        {
+            return new LicenseRepairStep(
+                "Reset named-user license mode",
+                "Skipped",
+                $"Licensing helper not found at {helperPath}");
+        }
+
+        var arguments = $"change -pk {ThreeDsMax2027ProductKey} -pv {ThreeDsMax2027ProductVersion} -lm \"\"";
+        var (success, standardOutput, standardError) = await RunProcessAsync(helperPath, arguments);
+        var details = string.IsNullOrWhiteSpace(standardOutput)
+            ? "Autodesk licensing helper completed."
+            : standardOutput.Trim();
+
+        if (!success)
+        {
+            details = string.IsNullOrWhiteSpace(standardError)
+                ? "Autodesk licensing helper returned a non-zero exit code."
+                : standardError.Trim();
+        }
+
+        return new LicenseRepairStep(
+            "Reset named-user license mode",
+            success ? "Applied" : "Failed",
+            details);
+    }
+
+    /// <summary>
+    /// Removes a registry value if it exists.
+    /// </summary>
+    private static LicenseRepairStep RemoveRegistryValueIfPresent(
+        RegistryHive hive,
+        RegistryView view,
+        string subKeyPath,
+        string valueName,
+        string displayPath)
+    {
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+            using var subKey = baseKey.OpenSubKey(subKeyPath, writable: true);
+            if (subKey is null)
+            {
+                return new LicenseRepairStep("Clear stale FLEXlm override", "Not present", displayPath);
+            }
+
+            var existingValue = subKey.GetValue(valueName);
+            if (existingValue is null)
+            {
+                return new LicenseRepairStep("Clear stale FLEXlm override", "Not present", displayPath);
+            }
+
+            var existingValueText = Convert.ToString(existingValue) ?? "<non-string>";
+            subKey.DeleteValue(valueName, throwOnMissingValue: false);
+
+            return new LicenseRepairStep(
+                "Clear stale FLEXlm override",
+                "Removed",
+                $"{displayPath} was set to '{existingValueText}'");
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Failed to remove registry value {DisplayPath}", displayPath);
+            return new LicenseRepairStep(
+                "Clear stale FLEXlm override",
+                "Failed",
+                $"{displayPath}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Removes the 3ds Max 2027 licensing service cache used by Autodesk's local licensing service.
+    /// </summary>
+    private static LicenseRepairStep RemoveAdskLicensingServiceCache()
+    {
+        const string licensingServiceRoot = @"C:\ProgramData\Autodesk\AdskLicensingService";
+
+        try
+        {
+            if (!Directory.Exists(licensingServiceRoot))
+            {
+                return new LicenseRepairStep(
+                    "Clear AdskLicensingService product cache",
+                    "Not present",
+                    licensingServiceRoot);
+            }
+
+            var matchingDirectories = Directory
+                .GetDirectories(licensingServiceRoot, $"{ThreeDsMax2027ProductKey}*", SearchOption.TopDirectoryOnly)
+                .ToList();
+
+            if (matchingDirectories.Count == 0)
+            {
+                return new LicenseRepairStep(
+                    "Clear AdskLicensingService product cache",
+                    "Not present",
+                    $"No {ThreeDsMax2027ProductKey} cache folders found under {licensingServiceRoot}");
+            }
+
+            foreach (var directoryPath in matchingDirectories)
+            {
+                Directory.Delete(directoryPath, recursive: true);
+            }
+
+            return new LicenseRepairStep(
+                "Clear AdskLicensingService product cache",
+                "Removed",
+                string.Join(", ", matchingDirectories.Select(Path.GetFileName)));
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Failed to remove Autodesk licensing service cache for product key {ProductKey}", ThreeDsMax2027ProductKey);
+            return new LicenseRepairStep(
+                "Clear AdskLicensingService product cache",
+                "Failed",
+                ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Sets a Windows service to Manual startup if it is installed.
+    /// </summary>
+    private static async Task<LicenseRepairStep> SetServiceStartupManualAsync(string serviceName)
+    {
+        try
+        {
+            var serviceExists = ServiceController.GetServices()
+                .Any(service => string.Equals(service.ServiceName, serviceName, StringComparison.OrdinalIgnoreCase));
+
+            if (!serviceExists)
+            {
+                return new LicenseRepairStep(
+                    "Set AdskNLM startup to Manual",
+                    "Not installed",
+                    $"{serviceName} is not registered on this machine.");
+            }
+
+            var (success, standardOutput, standardError) =
+                await RunProcessAsync("sc.exe", $"config \"{serviceName}\" start= demand");
+
+            var details = success
+                ? $"Updated {serviceName} startup type to Manual."
+                : string.IsNullOrWhiteSpace(standardError) ? standardOutput.Trim() : standardError.Trim();
+
+            return new LicenseRepairStep(
+                "Set AdskNLM startup to Manual",
+                success ? "Applied" : "Failed",
+                details);
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error(ex, "Failed to update startup type for service {ServiceName}", serviceName);
+            return new LicenseRepairStep(
+                "Set AdskNLM startup to Manual",
+                "Failed",
+                ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Gets the Autodesk licensing helper path used to reset product license mode.
+    /// </summary>
+    private static string GetAdskLicensingHelperPath()
+    {
+        var commonProgramFilesX86 = Environment.GetEnvironmentVariable("CommonProgramFiles(x86)");
+        if (string.IsNullOrWhiteSpace(commonProgramFilesX86))
+        {
+            commonProgramFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.CommonProgramFilesX86);
+        }
+
+        return Path.Combine(
+            commonProgramFilesX86,
+            "Autodesk Shared",
+            "AdskLicensing",
+            "Current",
+            "helper",
+            "AdskLicensingInstHelper.exe");
+    }
+
+    /// <summary>
+    /// Runs a process and captures its standard output and error.
+    /// </summary>
+    private static async Task<(bool Success, string StandardOutput, string StandardError)> RunProcessAsync(
+        string fileName,
+        string arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            return (false, string.Empty, $"Failed to start process: {fileName}");
+        }
+
+        var standardOutputTask = process.StandardOutput.ReadToEndAsync();
+        var standardErrorTask = process.StandardError.ReadToEndAsync();
+
+        await process.WaitForExitAsync();
+
+        return (process.ExitCode == 0, await standardOutputTask, await standardErrorTask);
+    }
+
+    /// <summary>
+    /// Displays the results of the licensing repair workflow.
+    /// </summary>
+    private static void DisplayLicenseRepairSummary(IReadOnlyCollection<LicenseRepairStep> repairSteps)
+    {
+        var table = new Table()
+        {
+            Border = TableBorder.Rounded,
+            BorderStyle = new Style(Color.Yellow)
+        };
+
+        table.AddColumn("[bold]Step[/]");
+        table.AddColumn("[bold]Status[/]");
+        table.AddColumn("[bold]Details[/]");
+
+        foreach (var repairStep in repairSteps)
+        {
+            var statusMarkup = repairStep.Status switch
+            {
+                "Applied" or "Removed" => $"[green]{repairStep.Status}[/]",
+                "Skipped" or "Not present" or "Not installed" => $"[yellow]{repairStep.Status}[/]",
+                "Failed" => $"[red]{repairStep.Status}[/]",
+                _ => repairStep.Status
+            };
+
+            table.AddRow(repairStep.Step, statusMarkup, Markup.Escape(repairStep.Details));
+        }
+
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader(" [bold yellow]3DS MAX 2027 LICENSING REPAIR[/] "),
+            Border = BoxBorder.Double,
+            BorderStyle = new Style(Color.Yellow)
+        };
+
+        AnsiConsole.Write(panel);
+
+        var hasFailure = repairSteps.Any(step => string.Equals(step.Status, "Failed", StringComparison.OrdinalIgnoreCase));
+        var nextStepsPanel = new Panel(new Markup(
+            "[bold cyan]Next steps[/]\n\n" +
+            "1. Reboot Windows.\n" +
+            "2. Launch 3ds Max 2027.\n" +
+            "3. Use the normal Autodesk sign-in / named-user flow.\n\n" +
+            (hasFailure
+                ? "[yellow]One or more repair steps failed. Review the details above before testing 3ds Max again.[/]"
+                : "[green]The stale FLEXlm override and local network-license settings have been repaired.[/]")))
+        {
+            Header = new PanelHeader(" [bold cyan]FOLLOW-UP[/] "),
+            Border = BoxBorder.Rounded,
+            BorderStyle = new Style(Color.Blue)
+        };
+
+        AnsiConsole.Write(nextStepsPanel);
     }
     
     /// <summary>
@@ -796,12 +1116,47 @@ internal static class Program
         }
         
         Console.WriteLine("\n=== DEBUG MODE COMPLETE ===");
-        Console.WriteLine("Press any key to exit...");
-        Console.ReadKey();
+        if (CanReadInteractiveKey())
+        {
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey(intercept: true);
+        }
+        else
+        {
+            Console.WriteLine("No interactive console detected, exiting without key prompt.");
+        }
         
         return 0;
     }
 #pragma warning restore Spectre1000
+
+    /// <summary>
+    /// Waits for a key press only when an interactive console is available.
+    /// </summary>
+    private static void WaitForUserKeyIfInteractive()
+    {
+        if (!CanReadInteractiveKey())
+        {
+            return;
+        }
+
+        Console.ReadKey(intercept: true);
+    }
+
+    /// <summary>
+    /// Determines whether the current process can safely read a key from the console.
+    /// </summary>
+    private static bool CanReadInteractiveKey()
+    {
+        try
+        {
+            return !Console.IsInputRedirected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
     
     /// <summary>
     /// Formats a file size into a human-readable string.
